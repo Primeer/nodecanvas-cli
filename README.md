@@ -5,6 +5,8 @@ FSMs and Dialogue Trees — in a Unity project from the command line, without op
 
 Built for coding agents (it ships as a Claude Code plugin) and just as usable by hand.
 
+![nodecanvas-cli: show, refs, apply --dry-run, lint](https://raw.githubusercontent.com/Primeer/nodecanvas-cli/main/docs/demo/demo.gif)
+
 NodeCanvas stores a graph as one long JSON string inside a Unity YAML asset. A 120-node behaviour tree
 is ~85 KB of folded JSON with GUID-linked variables and index-linked nodes. `nodecanvas-cli` shows the same tree
 in ~10 KB of readable text, answers "where is this used?", and applies edits as validated batches that

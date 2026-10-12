@@ -1,0 +1,2 @@
+[{"op": "add", "parent": "2", "index": 0, "node": {"$type": "ConditionNode",
+  "_condition": {"check": "Bot.CanSee", "args": ["$Target", 90], "agent": "$Self"}}}]

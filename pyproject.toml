@@ -39,6 +39,9 @@ nodecanvas-cli = "nodecanvas_cli.cli:main"
 mcp = ["mcp>=2.3; python_version >= '3.10'"]
 dev = ["pytest>=7", "mcp>=2.3; python_version >= '3.10'"]
 
+[tool.hatch.build.targets.sdist]
+exclude = ["docs"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/nodecanvas_cli"]
 
