@@ -41,6 +41,11 @@ def load(root: Path) -> Config:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except ValueError as e:
             raise ConfigError(f"{path}: invalid JSON: {e}") from e
+        if not isinstance(raw, dict):
+            raise ConfigError(f"{path}: expected a JSON object")
+        for section in ("layout", "scaffold"):
+            if not isinstance(raw.get(section) or {}, dict):
+                raise ConfigError(f"{path}: {section} must be an object")
         for k, v in (raw.get("layout") or {}).items():
             if not hasattr(layout, k):
                 raise ConfigError(f"{path}: unknown layout setting {k!r}")

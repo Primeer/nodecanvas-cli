@@ -15,9 +15,11 @@ format Unity produces.
 
 Run commands from anywhere inside the Unity project (or pass `--project <root>`). Use the first that works:
 
-1. `nodecanvas-cli <command> ...` — if it is on PATH (`pipx install nodecanvas-cli`).
-2. `<this skill's base directory>/scripts/nodecanvas-cli <command> ...` — the CLI bundled with the plugin;
-   needs only Python 3.9+. The base directory is shown when this skill loads.
+1. `nodecanvas-cli <command> ...` — on PATH when the skill comes with the Claude Code plugin (2.1.91+), or after
+   `pipx install nodecanvas-cli`.
+2. `<this skill's base directory>/scripts/nodecanvas-cli <command> ...` — the same bundled CLI by path;
+   needs only Python 3.9+ (`NODECANVAS_PYTHON` picks the interpreter). The base directory is shown when this
+   skill loads.
 3. `uvx nodecanvas-cli <command> ...` — once the package is on PyPI.
 
 Below, `nodecanvas-cli` stands for whichever of these works.
@@ -120,14 +122,15 @@ arity, so overload changes are visible in `show` and `diff`.
 - `nodecanvas-cli new Assets/.../X_BehaviourTree.asset --kind bt|fsm|dt [--var "Name:type[=value][:pub]"]
   [--from <graph>:<node>]` creates a graph with its `.meta` (new GUID), optionally starting with a copy
   of a subtree; with `--from` the copied variables are public, like `extract` makes them, so the graph
-  is ready to be used as a SubTree (`--private-vars` to keep them private). `--allow-outside` permits a path outside `Assets/`/`Packages/` for experiments.
+  is ready to be used as a SubTree. `--private-vars` keeps them all private; `--private-vars "Under attack *"`
+  (a name glob, repeatable) keeps only the matching ones private, e.g. the graph's local state. `--allow-outside` permits a path outside `Assets/`/`Packages/` for experiments.
 - `nodecanvas-cli extract <graph> <node> Assets/.../Part_BehaviourTree.asset [--name N]` moves a BT subtree into
   a new SubTree asset and puts a SubTree node in its place. Variables the subtree uses become public
   variables of the new graph and are mapped automatically (`←` read, `→` written, `↔` both).
 - `nodecanvas-cli inline <graph> <subtree-node>` is the reverse.
 - `nodecanvas-cli copy <src> <node> <dst|.> <parent|root> [--index i] [--create-vars]` copies a subtree
   (`root` makes it the root of an empty graph); variables are matched by name and type in the
-  destination. Variables created by `--create-vars` are private unless `--public-vars` is given, and keep their ids from the source graph (a new id only
+  destination. Variables created by `--create-vars` are private unless `--public-vars` is given (all of them, or `--public-vars "<glob>"` for the matching ones), and keep their ids from the source graph (a new id only
   on collision), so mappings that pointed at them keep working.
 
 ## Dialogue texts
@@ -159,7 +162,8 @@ drops the TODO comments (for projects that do not want comments).
 the blackboard, reflection bindings to members that no longer exist, unassigned or missing subgraphs,
 stale subgraph variable mappings, arguments whose stored or variable type does not fit the bound
 overload (`arg-type-mismatch`, with a `fix:` op when another overload fits), subgraph mappings between
-variables of different types, too many children for a node type, and unreachable nodes. It exits with 1 when there are errors. Run it
+variables of different types, too many children for a node type, unreachable nodes, and graph assets whose
+`m_Name` differs from the file name (`name-mismatch`, warning — e.g. after renaming the file outside Unity). It exits with 1 when there are errors. Run it
 after C# refactors that touch types used by graphs.
 
 Owners and blackboards: `missing-global-var` (warning) — `$Name/Var` has no GlobalBlackboard
@@ -204,7 +208,8 @@ wrappers); it changes files, so use it only when asked.
    enum values) or `nodecanvas-cli types --role action|condition|bt|composite|decorator|fsm|dt`.
    For reflection tasks: `nodecanvas-cli members <Type> [filter]` lists callable properties/methods.
 3. Write a JSON array of operations and run `nodecanvas-cli apply <graph> ops.json --dry-run` (or `-` for stdin).
-   Read the printed before/after diff and the `layout:` summary under it — it says how many nodes were
+   Read the printed before/after diff (blackboard changes follow it as `vars:` lines: `+`/`-` added or removed,
+   `~` renamed, retyped, new value, public/private) and the `layout:` summary under it — it says how many nodes were
    placed, moved by the edit, and which existing subtrees were shifted (and by how much) to make room.
    Add `--positions` to see coordinates in the diff. Then run again without `--dry-run`.
 4. `nodecanvas-cli show <graph>` again to get the new ids before the next batch.

@@ -74,6 +74,69 @@ UNITY_CORE = {
     "Ray",
     "RaycastHit",
 }
+# UnityEngine types outside UnityEngine.CoreModule (Unity 2017.2+ module split); Unity rewrites any other
+# assembly name on the next save, so writing the right one keeps diffs clean
+UNITY_MODULES = {
+    **dict.fromkeys(("AudioClip", "AudioSource", "AudioListener", "AudioReverbZone"), "UnityEngine.AudioModule"),
+    **dict.fromkeys(
+        (
+            "Rigidbody",
+            "Collider",
+            "BoxCollider",
+            "SphereCollider",
+            "CapsuleCollider",
+            "MeshCollider",
+            "CharacterController",
+            "RaycastHit",
+            "PhysicMaterial",
+            "PhysicsMaterial",
+            "ForceMode",
+            "QueryTriggerInteraction",
+            "Collision",
+            "ContactPoint",
+            "Joint",
+            "HingeJoint",
+            "FixedJoint",
+            "SpringJoint",
+            "ConfigurableJoint",
+        ),
+        "UnityEngine.PhysicsModule",
+    ),
+    **dict.fromkeys(
+        (
+            "Rigidbody2D",
+            "Collider2D",
+            "BoxCollider2D",
+            "CircleCollider2D",
+            "CapsuleCollider2D",
+            "PolygonCollider2D",
+            "EdgeCollider2D",
+            "RaycastHit2D",
+            "Collision2D",
+            "ForceMode2D",
+            "ContactFilter2D",
+        ),
+        "UnityEngine.Physics2DModule",
+    ),
+    **dict.fromkeys(
+        (
+            "Animator",
+            "AnimationClip",
+            "RuntimeAnimatorController",
+            "AnimatorOverrideController",
+            "Avatar",
+            "Animation",
+            "AnimationState",
+            "AvatarMask",
+        ),
+        "UnityEngine.AnimationModule",
+    ),
+    "ParticleSystem": "UnityEngine.ParticleSystemModule",
+    **dict.fromkeys(("Canvas", "CanvasGroup", "CanvasRenderer"), "UnityEngine.UIModule"),
+    **dict.fromkeys(("Font", "TextMesh"), "UnityEngine.TextRenderingModule"),
+    **dict.fromkeys(("Terrain", "TerrainData"), "UnityEngine.TerrainModule"),
+    **dict.fromkeys(("VideoClip", "VideoPlayer"), "UnityEngine.VideoModule"),
+}
 GENERIC_SYSTEM = {
     "List": "System.Collections.Generic.List",
     "Dictionary": "System.Collections.Generic.Dictionary",
@@ -160,7 +223,7 @@ class TypeNames:
         decl = self.ws.schema.find_simple(simple, ctx)
         if decl is not None:
             return decl.full_name
-        if simple in UNITY_CORE:
+        if simple in UNITY_CORE or simple in UNITY_MODULES:
             return f"UnityEngine.{simple}"
         return t
 
@@ -171,7 +234,8 @@ class TypeNames:
         if full.startswith("System."):
             return f"{full}, {MSCORLIB}"
         if full.startswith("UnityEngine."):
-            return f"{full}, UnityEngine.CoreModule, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"
+            module = UNITY_MODULES.get(full[len("UnityEngine.") :], "UnityEngine.CoreModule")
+            return f"{full}, {module}, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"
         decl = self.ws.schema.find(full)
         asm = self._assembly_of(decl) if decl is not None else "Assembly-CSharp"
         return f"{full}, {asm}, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"

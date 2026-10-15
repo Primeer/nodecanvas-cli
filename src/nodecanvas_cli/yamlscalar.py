@@ -201,7 +201,9 @@ def encode_single(key: str, key_indent: int, value: str) -> List[str]:
     while k < n:
         ch = value[k]
         if ch == " ":
-            if column >= BEST_WIDTH and k != 0 and k != n - 1 and value[k + 1] != " ":
+            # libyaml breaks only at the first of several spaces: a line may not end in a space,
+            # parsers drop trailing spaces when folding
+            if column >= BEST_WIDTH and k != 0 and k != n - 1 and value[k + 1] != " " and value[k - 1] != " ":
                 lines.append(cur)
                 cur = " " * indent
                 column = indent

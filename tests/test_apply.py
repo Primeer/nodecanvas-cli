@@ -277,6 +277,31 @@ def test_documented_extras(ncg, project):
     assert "--[!$Alert]--> #1 Combat" in show(ncg, "Bot_FSM")
 
 
+def test_var_set_public_only_keeps_value(ncg, project):
+    assert apply(ncg, project, "Bot_BT", [{"op": "var-set", "name": "Speed", "value": 7}])[0] == 0
+    code, _, err = apply(ncg, project, "Bot_BT", [{"op": "var-set", "name": "Speed", "public": True}])
+    assert code == 0, err
+    assert "$Speed: float = 7.0" in ncg("vars", "Bot_BT")[1]
+
+
+def test_dry_run_diff_shows_variable_changes(ncg, project):
+    ops = [
+        {"op": "var-add", "name": "Ammo", "type": "int", "value": 3, "public": True},
+        {"op": "var-rename", "name": "Speed", "to": "MoveSpeed"},
+        {"op": "var-set", "name": "MoveSpeed", "value": 7, "public": True},
+    ]
+    code, out, err = apply(ncg, project, "Bot_BT", ops, "--dry-run")
+    assert code == 0, err
+    assert "vars:" in out
+    assert "+ $Ammo: int = 3 pub" in out
+    assert "~ $MoveSpeed: renamed from $Speed; value " in out and "-> 7.0; private -> pub" in out
+    code, out, err = apply(
+        ncg, project, "Bot_BT", [{"op": "var-remove", "name": "Speed", "force": True}], "--dry-run", "--force"
+    )
+    assert code == 0, err
+    assert "- $Speed: float" in out, out
+
+
 def positions(ncg, graph):
     from nodecanvas_cli.workspace import Workspace
 
@@ -620,3 +645,51 @@ def test_external_field(ncg, project):
             ncg, project, "Bot_BT", [{"op": "add", "parent": "2", "node": {"$type": "ActionNode", "_action": spec}}]
         )
         assert code == 1 and msg in err, (spec, err)
+
+
+def test_choices_follow_their_connections(ncg, project):
+    # disconnecting keeps the choice text as an unlinked choice; reconnecting takes it back
+    ops = [
+        {"op": "disconnect", "from": "1", "to": "2"},
+        {"op": "add", "id": "b", "node": {"$type": "StatementNode", "statement": {"_text": "B"}}},
+        {"op": "connect", "from": "1", "to": "b", "index": 0},
+    ]
+    code, _, err = apply(ncg, project, "Talk_DT", ops)
+    assert code == 0, err
+    tree = show(ncg, "Talk_DT")
+    assert '1) "Who are you?" → #2' in tree and '#2 Say "B"' in tree and '2) "Let me pass." if $Met → #3' in tree
+    code, _, err = apply(ncg, project, "Talk_DT", [{"op": "remove", "node": "2"}], "--force")
+    assert code == 0, err
+    tree = show(ncg, "Talk_DT")
+    assert '1) "Let me pass." if $Met → #2' in tree and '2) "Who are you?" → #∅' in tree
+
+
+def test_choice_add_without_target_and_remove(ncg, project):
+    code, _, err = apply(ncg, project, "Talk_DT", [{"op": "choice-add", "node": "1", "text": "Later."}])
+    assert code == 0, err
+    assert '3) "Later." → #∅' in show(ncg, "Talk_DT")
+    ops = [{"op": "choice-remove", "node": "1", "choice": 1}, {"op": "choice-remove", "node": "1", "choice": 2}]
+    code, _, err = apply(ncg, project, "Talk_DT", ops, "--force")
+    assert code == 0, err
+    tree = show(ncg, "Talk_DT")
+    assert '1) "Let me pass." if $Met → #2' in tree and "2)" not in tree
+    code, _, err = apply(ncg, project, "Talk_DT", [{"op": "choice-add", "node": "1", "text": "x", "index": 0}])
+    assert code == 1 and "choices before it are linked" in err
+
+
+def test_saving_two_graphs_of_one_file(project):
+    from nodecanvas_cli.workspace import Workspace
+
+    src = (project / "Assets/Prefabs/Sentry.prefab").read_text()
+    head, body = src.split("--- ", 1)
+    twin = body.replace("&100", "&200").replace("fileID: 100", "fileID: 200").replace("m_Name: Sentry", "m_Name: Other")
+    (project / "Assets/Prefabs/Twin.prefab").write_text(src + "--- " + twin)
+    ws = Workspace(project)
+    a, b = ws.graph("Twin:Sentry"), ws.graph("Twin:Other")
+    a.nodes[0]["_comment"] = " ".join(["word"] * 400)  # the first graph grows by many folded lines
+    b.nodes[0]["_comment"] = "second"
+    ws.save(a)
+    ws.save(b)
+    ws = Workspace(project)
+    assert ws.graph("Twin:Sentry").nodes[0]["_comment"].startswith("word word")
+    assert ws.graph("Twin:Other").nodes[0]["_comment"] == "second"

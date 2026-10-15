@@ -57,8 +57,8 @@ class Workspace:
         q = query.strip()
         pool = [s for s in self.slots if kind is None or self._kind_of(s) == kind]
         p = Path(q)
-        if p.exists() or (self.project.root / q).exists():
-            rel = self.project.rel(p if p.is_absolute() or p.exists() else self.project.root / q)
+        if p.is_file() or (self.project.root / q).is_file():
+            rel = self.project.rel(p if p.is_absolute() or p.is_file() else self.project.root / q)
             slots = [s for s in pool if s.path == rel] or [
                 s for s in self.file(rel).slots() if kind is None or self._kind_of(s) == kind
             ]
@@ -156,8 +156,14 @@ class Workspace:
     # ------------------------------------------------------------------ saving
 
     def save(self, graph: Graph) -> None:
-        path = graph.loaded.slot.path
+        slot = graph.loaded.slot
+        path = slot.path
         f = self.file(path)
+        # another graph of this file may have been saved since this one was loaded: re-find its document
+        fresh = [s for s in f.slots() if (s.graph_key, s.anchor) == (slot.graph_key, slot.anchor)]
+        if len(fresh) != 1:
+            raise ContainerError(f"{slot.address}: the graph is no longer in {path}")
+        slot.doc_start, slot.doc_end = fresh[0].doc_start, fresh[0].doc_end
         f.store(graph.loaded)
         f.save()
         self._files.pop(path, None)

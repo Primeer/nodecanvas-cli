@@ -1,6 +1,6 @@
 {
   "name": "nodecanvas-cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Read, search, lint and edit NodeCanvas graphs (Behaviour Trees, FSMs, Dialogue Trees) in Unity projects through the nodecanvas-cli command, without opening Unity.",
   "author": {
     "name": "Aleksandr Esipov"

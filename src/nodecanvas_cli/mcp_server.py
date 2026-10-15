@@ -13,6 +13,7 @@ import contextlib
 import io
 import json
 import sys
+import threading
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -33,8 +34,18 @@ Reflected members print as @Var.Member with an agent override, Type.Member other
 transitions in order (--[condition]--> #3 Name), dialogue trees print a script."""
 
 
+# The MCP SDK runs sync tools in worker threads; stdout/stderr/stdin redirection is process-global.
+_CLI_LOCK = threading.Lock()
+
+
 def run_cli(project: Optional[str], args: List[str], stdin: Optional[str] = None) -> str:
-    """Run one CLI command in-process and return its output (stdout + stderr, exit code if non-zero)."""
+    """Run one CLI command in-process and return its output (stdout + stderr, exit code if non-zero).
+    Calls are serialized: concurrent tool calls would otherwise capture each other's output."""
+    with _CLI_LOCK:
+        return _run_cli(project, args, stdin)
+
+
+def _run_cli(project: Optional[str], args: List[str], stdin: Optional[str]) -> str:
     from .cli import main
 
     argv = (["--project", project] if project else []) + [str(a) for a in args]
@@ -241,11 +252,20 @@ def build_server(project: Optional[str] = None):
 
     @server.tool(annotations=rw)
     def new_graph(
-        path: str, kind: str, variables: Optional[List[str]] = None, source: Optional[str] = None, dry_run: bool = True
+        path: str,
+        kind: str,
+        variables: Optional[List[str]] = None,
+        source: Optional[str] = None,
+        private_vars: Optional[List[str]] = None,
+        dry_run: bool = True,
     ) -> str:
-        """Create a graph asset (+ .meta). variables: "Name:type[=value][:pub]"; source: "<graph>:<node>" to copy."""
+        """Create a graph asset (+ .meta). variables: "Name:type[=value][:pub]"; source: "<graph>:<node>" to copy
+        (its variables are created public); private_vars: name globs of copied variables to keep private ("*": all)."""
         var_args = [x for v in variables or [] for x in ("--var", v)]
-        return cli("new", path, "--kind", kind, *var_args, *_opt("--from", source), *_opt("--dry-run", dry_run))
+        priv_args = [f"--private-vars={p}" for p in private_vars or []]
+        return cli(
+            "new", path, "--kind", kind, *var_args, *_opt("--from", source), *priv_args, *_opt("--dry-run", dry_run)
+        )
 
     @server.tool(annotations=rw)
     def extract(graph: str, node: str, path: str, name: Optional[str] = None, dry_run: bool = True) -> str:
@@ -265,9 +285,11 @@ def build_server(project: Optional[str] = None):
         parent: str,
         index: Optional[int] = None,
         create_vars: bool = False,
+        public_vars: Optional[List[str]] = None,
         dry_run: bool = True,
     ) -> str:
-        """Copy a subtree into another (dst=".": the same) graph under `parent` ("root" for an empty graph)."""
+        """Copy a subtree into another (dst=".": the same) graph under `parent` ("root" for an empty graph).
+        public_vars: name globs of variables created by create_vars to make public ("*": all)."""
         return cli(
             "copy",
             src,
@@ -276,6 +298,7 @@ def build_server(project: Optional[str] = None):
             parent,
             *_opt("--index", index),
             *_opt("--create-vars", create_vars),
+            *[f"--public-vars={p}" for p in public_vars or []],
             *_opt("--dry-run", dry_run),
         )
 

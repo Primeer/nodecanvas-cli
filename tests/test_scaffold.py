@@ -58,3 +58,13 @@ def test_scaffold_refuses_bad_targets(ncg, project):
     assert code == 1 and "not a valid C# class name" in err
     code, _, err = ncg("scaffold", "action", "Y", "--dir", "Assets/Game", "--field", "oops")
     assert code == 1 and "--field" in err
+    code, _, err = ncg("scaffold", "action", "Y", "--dir", "Assets/Game", "--field", "name:Type\nOther=x")
+    assert code == 1 and "--field" in err
+
+
+def test_scaffold_dir_is_relative_to_the_project(project, tmp_path, monkeypatch, capsys):
+    from nodecanvas_cli.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    assert main(["--project", str(project), "scaffold", "action", "Far", "--dir", "Assets/Game"]) == 0
+    assert (project / "Assets/Game/Far.cs").exists()

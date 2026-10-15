@@ -180,6 +180,9 @@ def cmd_diff(ws: Workspace, a) -> int:
     from .container import UnityFile
     from .model import Graph
 
+    if a.rev.startswith("-"):
+        print(f"error: {a.rev!r} is not a revision", file=sys.stderr)
+        return 1
     g = ws.graph(a.graph, a.kind)
     slot = g.loaded.slot
     try:
@@ -306,11 +309,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-    try:
-        ws = Workspace(args.project)
-    except ProjectError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 2
     from .assets import AssetError
     from .build import BuildError
     from .config import ConfigError
@@ -318,9 +316,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     from .refactor import RefactorError
 
     try:
+        ws = Workspace(args.project)
+    except (ProjectError, ConfigError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    try:
         return args.func(ws, args) or 0
     except (GraphError, ContainerError, BuildError, OpError, AssetError, RefactorError, ConfigError) as e:
         print(f"error: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"error: {e.filename or ''}{': ' if e.filename else ''}{e.strerror or e}", file=sys.stderr)
         return 1
     finally:
         ws.close()

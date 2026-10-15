@@ -103,3 +103,18 @@ def test_file_scoped_namespace_and_generics():
     assert d.full_name == "A.B.Box`2"
     assert d.bases == ["Base<T>"]
     assert d.fields[0].name == "item"
+
+
+def test_attribute_strings_keep_non_ascii():
+    t = scan('[Name("Атаковать цель"), Description("a\\"b\\u0041")] public class Hit : ActionTask { }', "Hit.cs")[0]
+    assert t.attr_str("Name") == "Атаковать цель"
+    assert t.attr_str("Description") == 'a"bA'
+
+
+def test_enum_expressions_are_bounded():
+    from nodecanvas_cli.csharp import _eval_enum_expr
+
+    assert _eval_enum_expr("A | B << 2", {"A": 1, "B": 1}) == 5
+    assert _eval_enum_expr("~0x0F & 0xFF", {}) == 0xF0
+    assert _eval_enum_expr("9**9**9**9", {}) is None
+    assert _eval_enum_expr("1 << 100000", {}) is None

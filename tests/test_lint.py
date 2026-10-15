@@ -272,3 +272,16 @@ def test_allow_outside(ncg, project):
     assert f"created {project.resolve() / 'Scratch/Tmp_BT.asset'}" in out
     assert code == 0 and "Unity will not import it" in err
     assert (project / "Scratch/Tmp_BT.asset.meta").exists()
+
+
+def test_asset_name_must_match_file_name(ncg, project):
+    graphs = project / "Assets/Graphs"
+    for ext in ("", ".meta"):
+        (graphs / f"Patrol_BT.asset{ext}").rename(graphs / f"Guard_BT.asset{ext}")
+    code, out, _ = ncg("lint", "Guard_BT", "--json")
+    assert code == 0
+    issues = [i for i in json.loads(out) if i["code"] == "name-mismatch"]
+    assert len(issues) == 1 and issues[0]["severity"] == "warning"
+    assert "'Patrol_BT'" in issues[0]["message"] and "'Guard_BT'" in issues[0]["message"]
+    assert ncg("new", "Assets/Graphs/Fresh_BT.asset", "--kind", "bt")[0] == 0
+    assert "name-mismatch" not in ncg("lint", "Fresh_BT", "--json")[1]

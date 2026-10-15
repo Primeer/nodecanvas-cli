@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional
 
 from .bindings import check_task
@@ -199,13 +200,40 @@ def lint_graph(ws, g: Graph) -> List[Issue]:
         for fname, f in schema.fields(t).items():
             if any(a.endswith("AutoSortWithChildrenConnections") for a in f.attrs):
                 lst = node.get(fname)
-                if isinstance(lst, list) and len(lst) != len(kids):
+                # a MultipleChoiceNode may have choices not linked yet (dt lint: choice-unlinked)
+                spare_ok = simple_name(t) == "MultipleChoiceNode" and len(lst or []) > len(kids)
+                if isinstance(lst, list) and len(lst) != len(kids) and not spare_ok:
                     add(at, ERROR, "child-list-mismatch", f"{fname} has {len(lst)} entries for {len(kids)} children")
     for at, sev, code, msg in owners_mod.exposed_issues(ws, g):
         add(at, sev, code, msg)
     issues.extend(_layout_issues(ws, g, name))
     issues.extend(_variable_contracts(ws, g, name))
+    issues.extend(_asset_name(ws, g, name))
     return issues
+
+
+def _asset_name(ws, g: Graph, name: str) -> List[Issue]:
+    """Unity warns when a main asset's m_Name differs from its file name and shows the m_Name in pickers."""
+    from .container import _value_of
+
+    slot = g.loaded.slot
+    if slot.bound:
+        return []
+    f = g.loaded.file or ws.file(slot.path)
+    m_name = _value_of(f.lines, slot.doc_start, slot.doc_end, "m_Name")
+    stem = Path(slot.path).stem
+    if m_name is None or m_name == stem:
+        return []
+    return [
+        Issue(
+            name,
+            "asset",
+            WARNING,
+            "name-mismatch",
+            f"m_Name {m_name!r} differs from the file name {stem!r}: Unity warns on import and pickers show "
+            f"{m_name!r}; rename the file or fix m_Name",
+        )
+    ]
 
 
 def parent_mappings(ws) -> dict:

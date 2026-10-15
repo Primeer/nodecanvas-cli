@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import copy
 import difflib
+import fnmatch
 import re
 import sys
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from . import fsjson
 from .container import ObjectRef, UnityFile
@@ -158,8 +159,14 @@ def _check_new_path(ws, rel: str, allow_outside: bool = False) -> None:
 
 
 def _rel(ws, path: str) -> str:
+    """Relative paths are taken from the current directory inside the project, from its root otherwise
+    (``--project``, the MCP server)."""
     p = Path(path)
-    return ws.project.rel(p if p.is_absolute() else Path.cwd() / p)
+    if not p.is_absolute():
+        cwd = Path.cwd().resolve()
+        root = Path(ws.project.root).resolve()
+        p = (cwd if cwd == root or root in cwd.parents else root) / p
+    return ws.project.rel(p)
 
 
 # ---------------------------------------------------------------------- copying subtrees
@@ -215,8 +222,59 @@ def _owner_type(node: dict, path: Tuple) -> str:
     return t
 
 
+def object_ref_slots(ws, g: Graph, node: dict) -> List[Tuple[Any, Any]]:
+    """``(container, key)`` of every int in ``node`` that indexes the graph's ``_objectReferences``:
+    fields of a UnityEngine.Object type (also inside BBParameters, lists, nested classes and tasks),
+    found by the field types in the sources."""
+    from .render import _bb_inner, _elem_type
+
+    schema, r = ws.schema, ws.renderer(g)
+    out: Dict[Tuple[int, Any], Tuple[Any, Any]] = {}
+
+    def is_object(t: Optional[str], ctx) -> bool:
+        return bool(t) and "<" not in t and not t.endswith("[]") and r._is_unity_object(t, ctx)
+
+    def visit(v: Any, t: Optional[str], ctx, holder: Any, key: Any) -> None:
+        if isinstance(v, bool) or v is None:
+            return
+        if isinstance(v, int):
+            if is_object(t, ctx):
+                out[(id(holder), key)] = (holder, key)
+            return
+        if isinstance(v, list):
+            et = _elem_type(t)
+            for i, x in enumerate(v):
+                visit(x, et, ctx, v, i)
+            return
+        if not isinstance(v, dict):
+            return
+        if "$content" in v:
+            visit(v["$content"], v.get("$type") or t, ctx, v, "$content")
+            return
+        if "_value" in v and (_bb_inner(t) or "_type" in v or (t or "").startswith("BBObjectParameter")):
+            if not (v.get("_name") or v.get("_targetVariableID")):
+                inner = v.get("_type") or _bb_inner(t)
+                visit(v["_value"], inner.split(",")[0] if inner else None, ctx, v, "_value")
+            return
+        dt = v.get("$type") or t
+        decl = schema.find(dt) if dt else None
+        if decl is None and dt:
+            decl = schema.find_simple(simple_name(dt).split("<")[0], ctx)
+        fields = {n: (f, c) for n, f, c in schema.ordered_fields(decl.full_name)} if decl is not None else {}
+        for k, x in v.items():
+            f = fields.get(k)
+            visit(x, f[0].type if f else None, f[1] if f else ctx, v, k)
+
+    visit(node, None, None, None, None)
+    for k in NESTED_KEYS:  # subgraph references, even when the node type is not in the sources
+        v = node.get(k)
+        if isinstance(v, dict) and isinstance(v.get("_value"), int):
+            out[(id(v), "_value")] = (v, "_value")
+    return list(out.values())
+
+
 def clone(
-    src: Graph, dst: Graph, nodes: List[dict], var_map: Dict[str, dict], keep_uid: bool = True
+    ws, src: Graph, dst: Graph, nodes: List[dict], var_map: Dict[str, dict], keep_uid: bool = True
 ) -> Tuple[List[dict], List[dict]]:
     """Deep-copy ``nodes`` (with their internal connections) for ``dst``: variable ids and object refs remapped.
 
@@ -234,11 +292,10 @@ def clone(
                 d["_targetVariableID"] = var_map[vid]["_id"]
                 if "_name" in d:
                     d["_name"] = var_map[vid]["_name"]
-        for k in NESTED_KEYS:
-            v = c.get(k)
-            if isinstance(v, dict) and isinstance(v.get("_value"), int):
-                ref = src.ref(v["_value"])
-                v["_value"] = dst.ref_index(ref) if ref is not None and not ref.is_null else 0
+        if src is not dst:
+            for holder, key in object_ref_slots(ws, src, c):
+                ref = src.ref(holder[key])
+                holder[key] = dst.ref_index(ref) if ref is not None and not ref.is_null else 0
     conns = []
     for n in nodes:
         for c in src.out.get(src.nid(n), []):
@@ -346,9 +403,11 @@ def cmd_new(ws, a) -> int:
             raise AssetError("--from takes <graph>:<node>")
         src_name, node_ref = a.source.rsplit(":", 1)
         src = ws.graph(src_name)
-        _, created = copy_subtree(ws, src, node_ref, g, "root", None, True, public_vars=not a.private_vars)
+        private = var_matcher(a.private_vars)
+        _, created = copy_subtree(ws, src, node_ref, g, "root", None, True, public_vars=lambda n: not private(n))
         if created:
             print("created variables: " + ", ".join("$" + n for n in created))
+        _warn_unmatched("--private-vars", a.private_vars, created)
     _print_views(ws, {}, [g])
     return _finish(ws, a, [(f, g, uuid.uuid4().hex)], [])
 
@@ -375,7 +434,7 @@ def cmd_extract(ws, a) -> int:
             nv["$type"] = v["$type"]
             sub.blackboard["_variables"][name] = nv
             var_map[v["_id"]] = nv
-    copies, conns = clone(g, sub, nodes, var_map)
+    copies, conns = clone(ws, g, sub, nodes, var_map)
     sub.data["nodes"] = copies
     sub.data["connections"] = conns
     sub.reindex()
@@ -450,7 +509,7 @@ def cmd_inline(ws, a) -> int:
         var_map[v["_id"]] = nv
         created_vars.append(new_name)
     nodes = subtree_nodes(sub, sub.prime)
-    copies, conns = clone(sub, g, nodes, var_map)
+    copies, conns = clone(ws, sub, g, nodes, var_map)
     ed = Editor(ws, g)
     parent = (g.parents(node) or [None])[0]
     old_pos = ed.lay.pos(node)
@@ -489,10 +548,11 @@ def copy_subtree(
     parent_ref: str,
     index: Optional[int],
     create_vars: bool,
-    public_vars: bool = False,
+    public_vars: Union[bool, Callable[[str], bool]] = False,
 ):
     """Copy ``src``'s subtree at ``node_ref`` under ``parent_ref`` in ``dst`` (``root``: as the root of an
-    empty graph). Returns ``(editor, created variable names)``."""
+    empty graph). ``public_vars`` says which created variables are public: all, none, or by name.
+    Returns ``(editor, created variable names)``."""
     from .ops import Editor, OpError
 
     root = src.node(node_ref)
@@ -522,14 +582,14 @@ def copy_subtree(
     for v in missing:
         nv = copy.deepcopy(v)
         nv.pop("_isPublic", None)
-        if public_vars:
+        if public_vars(v["_name"]) if callable(public_vars) else public_vars:
             nv["_isPublic"] = True
         nv["$type"] = nv.pop("$type")
         if dst.var_by_id(nv["_id"]) is not None:
             nv["_id"] = str(uuid.uuid4())
         dst.blackboard["_variables"][nv["_name"]] = nv
         var_map[v["_id"]] = nv
-    copies, conns = clone(src, dst, nodes, var_map, keep_uid=False)
+    copies, conns = clone(ws, src, dst, nodes, var_map, keep_uid=False)
     ed = Editor(ws, dst)
     was_empty = not dst.nodes
     parent = None if as_root else (dst.node(parent_ref) if dst is not src else ed.node(parent_ref))
@@ -551,11 +611,24 @@ def copy_subtree(
     return ed, [v["_name"] for v in missing]
 
 
+def var_matcher(patterns: Optional[List[str]]) -> Callable[[str], bool]:
+    """Name predicate for --private-vars/--public-vars: absent matches nothing, a bare flag ("*") everything."""
+    pats = patterns or []
+    return lambda name: any(fnmatch.fnmatchcase(name, p) for p in pats)
+
+
+def _warn_unmatched(flag: str, patterns: Optional[List[str]], created: List[str]) -> None:
+    for p in patterns or []:
+        if not any(fnmatch.fnmatchcase(n, p) for n in created):
+            print(f"warning: {flag} {p!r} matches no created variable", file=sys.stderr)
+
+
 def cmd_copy(ws, a) -> int:
     src = ws.graph(a.src)
     dst = src if a.dst in (a.src, ".") else ws.graph(a.dst)
     before = {dst.loaded.slot.address: _view(ws, dst)}
-    ed, created = copy_subtree(ws, src, a.node, dst, a.parent, a.index, a.create_vars, a.public_vars)
+    ed, created = copy_subtree(ws, src, a.node, dst, a.parent, a.index, a.create_vars, var_matcher(a.public_vars))
+    _warn_unmatched("--public-vars", a.public_vars, created)
     _print_views(ws, before, [dst])
     summary = ed.layout_summary()
     if summary:
@@ -587,7 +660,14 @@ def register(sub) -> None:
         help="start with a copy of <graph>:<node>; its variables are created public, "
         "like extract does, so the graph is ready to be a SubTree",
     )
-    s.add_argument("--private-vars", action="store_true", help="with --from: create the variables private")
+    s.add_argument(
+        "--private-vars",
+        action="append",
+        nargs="?",
+        const="*",
+        metavar="PATTERN",
+        help="with --from: create the variables private; with a name glob (repeatable), only the matching ones",
+    )
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--force", action="store_true")
     s.add_argument(
@@ -621,7 +701,14 @@ def register(sub) -> None:
     s.add_argument("parent", help="node in the destination to attach the copy to, or 'root' for an empty graph")
     s.add_argument("--index", type=int)
     s.add_argument("--create-vars", action="store_true", help="create missing variables in the destination")
-    s.add_argument("--public-vars", action="store_true", help="make variables created by --create-vars public")
+    s.add_argument(
+        "--public-vars",
+        action="append",
+        nargs="?",
+        const="*",
+        metavar="PATTERN",
+        help="make variables created by --create-vars public; with a name glob (repeatable), only the matching ones",
+    )
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--force", action="store_true")
     s.set_defaults(func=_guard(cmd_copy))

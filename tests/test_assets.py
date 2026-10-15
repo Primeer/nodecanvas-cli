@@ -81,6 +81,20 @@ def test_copy_between_graphs(ncg, project):
     assert ncg("lint", "Fresh_BT")[0] == 0
 
 
+def test_variable_visibility_by_pattern(ncg, project):
+    args = ["new", "Assets/Graphs/Mixed_BT.asset", "--kind", "bt", "--from", "Bot_BT:4"]
+    code, out, err = ncg(*args, "--private-vars", "Cool *", "--private-vars=Nope*")
+    assert code == 0, err
+    assert "warning: --private-vars 'Nope*' matches no created variable" in err
+    head = ncg("show", "Mixed_BT")[1].splitlines()[1] + "  "
+    assert "Cool time:float  " in head and "Target:Unit(pub)" in head and "Self:Bot(pub)" in head
+    assert ncg("new", "Assets/Graphs/Fresh_BT.asset", "--kind", "bt")[0] == 0
+    code, out, err = ncg("copy", "Bot_BT", "4", "Fresh_BT", "root", "--create-vars", "--public-vars", "T*")
+    assert code == 0, err
+    head = ncg("show", "Fresh_BT")[1].splitlines()[1] + "  "
+    assert "Target:Unit(pub)" in head and "Cool time:float  " in head and "Self:Bot  " in head
+
+
 def test_copy_within_graph_keeps_variables(ncg, project):
     code, out, err = ncg("copy", "Bot_BT", "4", ".", "0", "--index", "0")
     assert code == 0, err
@@ -127,3 +141,44 @@ def test_copy_as_root_and_new_from(ncg, project):
     assert ncg("new", "Assets/Graphs/Priv_BT.asset", "--kind", "bt", "--from", "Bot_BT:4", "--private-vars")[0] == 0
     assert "Cool time:float  " in ncg("show", "Priv_BT")[1] + "  "
     assert ncg("lint", "Strike_BT", "Empty_BT")[0] == 0
+
+
+def test_copies_remap_object_references(ncg, project):
+    from nodecanvas_cli.container import ObjectRef
+    from nodecanvas_cli.workspace import Workspace
+
+    audio = ObjectRef(8300000, "a" * 32, 3)
+    ws = Workspace(project)
+    g = ws.graph("Talk_DT")
+    g.nodes[0]["statement"]["_audio"] = g.ref_index(audio)
+    ws.save(g)
+    code, _, err = ncg("new", "Assets/Graphs/Copy_DT.asset", "--kind", "dt", "--from", "Talk_DT:0")
+    assert code == 0, err
+    c = Workspace(project).graph("Copy_DT")
+    assert c.ref(c.nodes[0]["statement"]["_audio"]) == audio, c.refs
+    # a destination with references of its own: the clip is appended, not aliased to its index 1
+    from nodecanvas_cli.assets import clone
+
+    ws = Workspace(project)
+    src, dst = ws.graph("Talk_DT"), ws.graph("Bot_BT")
+    copies, _ = clone(ws, src, dst, [src.nodes[0]], {})
+    assert dst.ref(copies[0]["statement"]["_audio"]) == audio and len(dst.refs) == 3
+
+
+def test_object_ref_slots_follow_field_types(project):
+    from nodecanvas_cli.assets import object_ref_slots
+    from nodecanvas_cli.workspace import Workspace
+
+    ws = Workspace(project)
+    g = ws.graph("Talk_DT")
+    node = {
+        "$type": "NodeCanvas.DialogueTrees.StatementNode",
+        "statement": {"_text": "hi", "_audio": 3},
+        "_position": {"x": 1, "y": 2},
+    }
+    task = {
+        "$type": "NodeCanvas.Framework.Internal.ReflectedActionWrapper",
+        "parameters": [{"_type": "UnityEngine.GameObject", "_value": 4}, {"_type": "System.Int32", "_value": 5}],
+    }
+    slots = object_ref_slots(ws, g, node) + object_ref_slots(ws, g, task)
+    assert sorted(h[k] for h, k in slots) == [3, 4]

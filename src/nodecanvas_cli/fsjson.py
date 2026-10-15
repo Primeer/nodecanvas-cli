@@ -25,7 +25,8 @@ class Num(float):
 
 
 def loads(text: str) -> Any:
-    return json.loads(text, parse_float=Num)
+    # FullSerializer writes float infinities and NaN as bare Infinity/-Infinity/NaN
+    return json.loads(text, parse_float=Num, parse_constant=Num)
 
 
 _ESC = {'"': '\\"', "\\": "\\\\", "\n": "\\n", "\r": "\\r", "\t": "\\t", "\b": "\\b", "\f": "\\f"}

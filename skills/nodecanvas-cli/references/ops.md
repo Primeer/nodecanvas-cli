@@ -132,6 +132,9 @@ Use `set` with `"from"`/`"to"` and `"path": "_condition"` to change a transition
 | Op | Fields | Notes |
 |---|---|---|
 | `choice-add` | `node`, `text`, `to`?, `condition`?, `meta`?, `index`? | Adds a choice to a `MultipleChoiceNode` and, with `to`, connects it. |
+| `choice-remove` | `node`, `choice` | Removes choice number `choice` (1-based, as `show` numbers them) and its connection. |
+
+Choices are matched to connections by position. A choice without a connection stays after the linked ones: `choice-add` without `to` appends one, `disconnect`/`remove` of a choice's target keeps its text as an unlinked choice, and the next `connect` from the node takes the first unlinked choice.
 
 Statements: `{"$type": "StatementNode", "_actorName": "Guard", "statement": {"_text": "Hi"}}`.
 

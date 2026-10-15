@@ -37,7 +37,7 @@ vars: Self:Bot(pub)  Target:Unit  Alert:bool  Cool time:float  Speed:float
   this finds them.
 - **lint** — missing task/variable types, dangling blackboard references, reflection bindings to members
   that no longer exist, missing subgraphs and stale variable mappings, too many children for a node
-  type, unreachable nodes.
+  type, unreachable nodes, graph assets whose `m_Name` differs from the file name.
 - **apply** — atomic batches of edit operations: add / remove / move / wrap / unwrap / replace nodes, set
   fields, connect and disable, blackboard variables, subgraph mappings, FSM transitions, dialogue
   choices. Short value forms (`"$Var"`, enum names, `[x, y, z]`, `{"call": "Type.Method", ...}`) are
@@ -70,9 +70,6 @@ uvx --from git+https://github.com/Primeer/nodecanvas-cli nodecanvas-cli --help  
 python -m nodecanvas_cli --help                                                 # from a checkout, with src/ on PYTHONPATH
 ```
 
-The Claude Code plugin also bundles a launcher, `skills/nodecanvas-cli/scripts/nodecanvas-cli`, which runs the CLI
-from the plugin's own sources with any Python 3.9+.
-
 ### Claude Code plugin
 
 The repository is also a Claude Code plugin marketplace containing the `nodecanvas-cli` plugin, which adds a
@@ -82,6 +79,17 @@ skill that teaches the agent when and how to use the CLI:
 /plugin marketplace add Primeer/nodecanvas-cli
 /plugin install nodecanvas-cli@nodecanvas-cli
 ```
+
+The plugin also puts `nodecanvas-cli` on the agent's PATH (Claude Code 2.1.91+), so no separate install is needed:
+its `bin/` launcher runs the CLI from the plugin's own sources with any Python 3.9+, always in step with the skill.
+The launcher is a POSIX `sh` script — it works on macOS, Linux, WSL and in Git Bash on Windows; it can also be
+symlinked into a directory on your PATH. Set `NODECANVAS_PYTHON` to pick the interpreter. Older Claude Code
+versions and agents that load the skill on its own can call `skills/nodecanvas-cli/scripts/nodecanvas-cli`.
+
+Install the CLI with pipx as well when you want it in your own terminal or as an MCP server, or when the launcher
+does not fit (native Windows shells without `sh`): pipx creates a regular `nodecanvas-cli` executable, `.exe` on
+Windows, and the agent uses it the same way — whichever comes first on PATH wins. Update it with
+`pipx upgrade nodecanvas-cli` together with the plugin, so the skill and the CLI stay on the same version.
 
 ### MCP server (Cursor, Codex, Gemini and other agents)
 

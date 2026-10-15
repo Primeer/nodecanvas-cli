@@ -26,7 +26,11 @@ CHILD_LISTS = {  # lists kept parallel to a node's children, with the element ad
     "NodeCanvas.BehaviourTrees.ProbabilitySelector": ("childWeights", lambda: {"_value": 1.0}),
     "NodeCanvas.DialogueTrees.ProbabilitySelector": ("childOptions", lambda: {"weight": {"_value": 1.0}}),
     "NodeCanvas.DialogueTrees.MultipleConditionNode": ("conditions", lambda: None),
+    "NodeCanvas.DialogueTrees.MultipleChoiceNode": ("availableChoices", lambda: {"statement": {"_text": ""}}),
 }
+# Lists that may be longer than the children: entries past the last child are not linked yet
+# (a MultipleChoiceNode's choices without a connection). Unlinking keeps the entry, as the first unlinked one.
+UNLINKED_ENTRIES = {"NodeCanvas.DialogueTrees.MultipleChoiceNode"}
 CONNECTION_TYPES = {
     "bt": "NodeCanvas.BehaviourTrees.BTConnection",
     "fsm": "NodeCanvas.StateMachines.FSMConnection",
@@ -101,6 +105,10 @@ class Editor:
             return
         field, factory = spec
         lst = parent.setdefault(field, [])
+        linked = len(self.g.out.get(self.nid(parent), []))  # the new connection included
+        if not has_item and self._keeps_unlinked(parent) and len(lst) >= linked:
+            lst.insert(index, lst.pop(linked - 1))  # the connection takes the first unlinked entry
+            return
         lst.insert(index, item if has_item else factory())
 
     def _child_list_remove(self, parent: dict, index: int) -> Any:
@@ -109,8 +117,15 @@ class Editor:
             return None
         lst = parent.get(spec[0])
         if isinstance(lst, list) and index < len(lst):
+            if self._keeps_unlinked(parent):
+                lst.insert(len(self.g.out.get(self.nid(parent), [])), lst.pop(index))
+                return None
             return lst.pop(index)
         return None
+
+    @staticmethod
+    def _keeps_unlinked(node: dict) -> bool:
+        return node.get("$type", "").split("[")[0] in UNLINKED_ENTRIES
 
     def _link(
         self,
@@ -243,9 +258,11 @@ class Editor:
         if old_parents:
             src = old_parents[0] if op.get("from") is None else self.node(op["from"])
             c, _, item = self._unlink(src, node)
-            has_item = CHILD_LISTS.get(src.get("$type", "")) is not None and CHILD_LISTS.get(
-                src.get("$type", "")
-            ) == CHILD_LISTS.get(parent.get("$type", ""))
+            spec = CHILD_LISTS.get(src.get("$type", ""))
+            # a choice stays with its MultipleChoiceNode; other entries travel with the child
+            has_item = (
+                spec is not None and spec == CHILD_LISTS.get(parent.get("$type", "")) and not self._keeps_unlinked(src)
+            )
             extra = {k: v for k, v in c.items() if k not in ("_sourceNode", "_targetNode", "$type", "$id")}
         self._link(parent, node, op.get("index"), extra, item, has_item)
         self.place_roots.append(node)
@@ -425,14 +442,22 @@ class Editor:
 
     def op_var_set(self, op: dict) -> None:
         var = self.b.var(op["name"])
-        t = var.get("$type", "")
+        if "value" in op:
+            self._var_set_value(var, op["value"])
+        if "public" in op:
+            if op["public"]:
+                var["_isPublic"] = True
+                var["$type"] = var.pop("$type")
+            else:
+                var.pop("_isPublic", None)
+
+    def _var_set_value(self, var: dict, value: Any) -> None:
+        from .build import _is_default
         from .schema import generic_args
 
-        args = generic_args(t)
+        args = generic_args(var.get("$type", ""))
         inner = args[0] if args else None
-        lit = self.b.literal(op.get("value"), inner, None) if inner else op.get("value")
-        from .build import _is_default
-
+        lit = self.b.literal(value, inner, None) if inner else value
         keys = list(var)
         if _is_default(lit):
             var.pop("_value", None)
@@ -441,12 +466,6 @@ class Editor:
             new.update({k: var[k] for k in keys if k != "_value"})
             var.clear()
             var.update(new)
-        if "public" in op:
-            if op["public"]:
-                var["_isPublic"] = True
-                var["$type"] = var.pop("$type")
-            else:
-                var.pop("_isPublic", None)
 
     def op_subgraph_set(self, op: dict) -> None:
         node = self.node(op["node"])
@@ -538,7 +557,12 @@ class Editor:
         if simple_name(node.get("$type", "")) != "MultipleChoiceNode":
             raise OpError("choice-add works on MultipleChoiceNode")
         choices = node.setdefault("availableChoices", [])
-        index = op.get("index", len(choices))
+        linked = len(self.g.out.get(self.nid(node), []))
+        index = op.get("index", linked if op.get("to") is not None else len(choices))
+        if op.get("to") is not None and not 0 <= index <= linked:
+            raise OpError(f"with 'to', index must be 0..{linked} (the choices linked so far)")
+        if op.get("to") is None and not linked <= index <= len(choices):
+            raise OpError(f"without 'to', index must be {linked}..{len(choices)}: choices before it are linked")
         choice: Dict[str, Any] = {}
         statement = {"_text": op.get("text", "")}
         if op.get("meta"):
@@ -551,6 +575,20 @@ class Editor:
             dst = self.node(op["to"])
             c = self._new_connection(node, dst)
             self._insert_connection(c, node, index)
+
+    def op_choice_remove(self, op: dict) -> None:
+        node = self.node(op["node"])
+        if simple_name(node.get("$type", "")) != "MultipleChoiceNode":
+            raise OpError("choice-remove works on MultipleChoiceNode")
+        choices = node.get("availableChoices") or []
+        number = op.get("choice")
+        if not isinstance(number, int) or not 1 <= number <= len(choices):
+            raise OpError(f"choice must be 1..{len(choices)} (as numbered by show)")
+        choices.pop(number - 1)
+        kids = self.g.out.get(self.nid(node), [])
+        if number - 1 < len(kids):
+            self.g.connections.remove(kids[number - 1])
+            self.g.reindex()
 
     def op_layout(self, op: dict) -> None:
         self.relayout_roots.append(self.node(op.get("node", "0")))
@@ -658,6 +696,7 @@ OPS = {
     "transition-add": Editor.op_transition_add,
     "transition-remove": Editor.op_transition_remove,
     "choice-add": Editor.op_choice_add,
+    "choice-remove": Editor.op_choice_remove,
     "layout": Editor.op_layout,
     "simplify": Editor.op_simplify,
 }
@@ -721,6 +760,48 @@ def _strip_ids(lines: List[str]) -> List[str]:
     return [re.sub(r"#\d+", "#", line) for line in lines]
 
 
+def _var_snapshot(ws, g: Graph) -> Dict[str, dict]:
+    from .views import var_type
+
+    r = ws.renderer(g)
+    out = {}
+    for name, v in g.variables.items():
+        t = var_type(v, ws.schema)
+        val = r.literal(v["_value"], t) if "_value" in v else None
+        out[v.get("_id") or name] = {"name": name, "type": t, "value": val, "pub": bool(v.get("_isPublic"))}
+    return out
+
+
+def _var_line(s: dict) -> str:
+    if s["type"] == "VariableSeperator":
+        return f"-- {s['name']} --"
+    val = f" = {s['value']}" if s["value"] is not None else ""
+    return f"${s['name']}: {s['type']}{val}{' pub' if s['pub'] else ''}"
+
+
+def var_diff(before: Dict[str, dict], after: Dict[str, dict]) -> List[str]:
+    """Blackboard changes matched by variable id: added, removed, renamed, retyped, revalued, (un)published."""
+    out = []
+    for vid, a in after.items():
+        b = before.get(vid)
+        if b is None:
+            out.append("+ " + _var_line(a))
+            continue
+        changes = []
+        if a["name"] != b["name"]:
+            changes.append(f"renamed from ${b['name']}")
+        if a["type"] != b["type"]:
+            changes.append(f"type {b['type']} -> {a['type']}")
+        if a["value"] != b["value"]:
+            changes.append(f"value {b['value'] or 'default'} -> {a['value'] or 'default'}")
+        if a["pub"] != b["pub"]:
+            changes.append("private -> pub" if a["pub"] else "pub -> private")
+        if changes:
+            out.append(f"~ ${a['name']}: " + "; ".join(changes))
+    out += ["- " + _var_line(b) for vid, b in before.items() if vid not in after]
+    return ["vars:"] + out if out else []
+
+
 def cmd_apply(ws, a) -> int:
     g = ws.graph(a.graph, a.kind)
     text = sys.stdin.read() if a.ops == "-" else Path(a.ops).read_text(encoding="utf-8")
@@ -738,6 +819,7 @@ def cmd_apply(ws, a) -> int:
         return render_graph(g, r, with_header=False)
 
     before_lines = view()
+    before_vars = _var_snapshot(ws, g)
     before_lint = {(i.code, i.message) for i in lint_graph(ws, g) if i.severity == ERROR}
     from .bindings import call_args, lost_bindings_by_identity
 
@@ -756,6 +838,7 @@ def cmd_apply(ws, a) -> int:
     diff = list(
         difflib.unified_diff(_strip_ids(before_lines), _strip_ids(after_lines), "before", "after", n=1, lineterm="")
     )
+    diff += var_diff(before_vars, _var_snapshot(ws, g))
     print("\n".join(diff) if diff else "(no visible change)")
     summary = ed.layout_summary()
     if summary:

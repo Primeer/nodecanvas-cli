@@ -21,6 +21,20 @@ def test_run_cli_reports_exit_code(project):
     assert "no graph matches" in out and "(exit code 1)" in out
 
 
+def test_run_cli_is_thread_safe(project):
+    import sys
+    from concurrent.futures import ThreadPoolExecutor
+
+    from nodecanvas_cli.mcp_server import run_cli
+
+    expected = {a: run_cli(str(project), [a, "Bot_BT"]) for a in ("show", "vars")}
+    stdout = sys.stdout
+    with ThreadPoolExecutor(6) as pool:
+        jobs = [(a, pool.submit(run_cli, str(project), [a, "Bot_BT"])) for _ in range(5) for a in expected]
+        assert all(f.result() == expected[a] for a, f in jobs)
+    assert sys.stdout is stdout
+
+
 def _text(result) -> str:
     return "".join(c.text for c in result.content if getattr(c, "type", "") == "text")
 
@@ -49,6 +63,10 @@ def test_mcp_tools_in_memory(project):
             out = _text(await c.call_tool("apply", {"graph": "Bot_BT", "ops": ops, "dry_run": False}))
             assert "saved Assets/Graphs/Bot_BT.asset" in out
             assert "via mcp" in _text(await c.call_tool("show", {"graph": "Bot_BT"}))
+            args = {"path": "Assets/Graphs/M_BT.asset", "kind": "bt", "source": "Bot_BT:4", "private_vars": ["Cool *"]}
+            out = _text(await c.call_tool("new_graph", {**args, "dry_run": False}))
+            head = _text(await c.call_tool("show", {"graph": "M_BT"})).splitlines()[1] + "  "
+            assert "Cool time:float  " in head and "Target:Unit(pub)" in head, out
 
     asyncio.run(go())
 

@@ -25,7 +25,7 @@ KINDS = {
     ),
 }
 _NS_RE = re.compile(r"^\s*namespace\s+([\w.]+)", re.M)
-_FIELD_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*:\s*([^=]+?)\s*(?:=\s*(.*?))?\s*$")
+_FIELD_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*:\s*([^=\r\n]+?)\s*(?:=\s*(.*?))?\s*$")
 
 
 class ScaffoldError(Exception):
@@ -183,9 +183,10 @@ def cmd_scaffold(ws, a) -> int:
     root = ws.project.root
     if not re.match(r"^[A-Za-z_]\w*$", a.name):
         raise ScaffoldError(f"{a.name!r} is not a valid C# class name")
+    from .assets import _rel
+
     d = Path(a.dir)
-    d = d if d.is_absolute() else (Path.cwd() / d)
-    d = d.resolve()
+    d = (d if d.is_absolute() else root / _rel(ws, a.dir)).resolve()
     if root not in d.parents and d != root:
         raise ScaffoldError(f"{a.dir} is outside the Unity project")
     rel_dir = d.relative_to(root).as_posix()

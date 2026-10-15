@@ -1,15 +1,43 @@
 #!/bin/sh
 # Runs the nodecanvas-cli command bundled with this plugin (no installation needed; Python 3.9+).
-here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-src="$here/../../../src"
+# The same file lives in bin/ and skills/nodecanvas-cli/scripts/; tests keep them identical.
+self=$0
+while [ -L "$self" ]; do
+    link=$(readlink -- "$self")
+    case $link in
+        /*) self=$link ;;
+        *) self=$(dirname -- "$self")/$link ;;
+    esac
+done
+here=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd -P)
+for src in "$here/../src" "$here/../../../src"; do
+    [ -d "$src/nodecanvas_cli" ] && break
+done
 if [ ! -d "$src/nodecanvas_cli" ]; then
-    echo "nodecanvas-cli: bundled sources not found at $src; install with 'pipx install nodecanvas-cli'" >&2
+    echo "nodecanvas-cli: bundled sources not found next to $here; install with 'pipx install nodecanvas-cli'" >&2
     exit 2
 fi
-for py in python3 python; do
-    if command -v "$py" >/dev/null 2>&1; then
-        PYTHONPATH="$src${PYTHONPATH:+:$PYTHONPATH}" exec "$py" -m nodecanvas_cli "$@"
+usable() {
+    command -v "$1" >/dev/null 2>&1 &&
+        "$1" -c 'import sys; sys.exit(sys.version_info < (3, 9))' >/dev/null 2>&1
+}
+if [ -n "${NODECANVAS_PYTHON:-}" ]; then
+    py=$NODECANVAS_PYTHON
+    if ! usable "$py"; then
+        echo "nodecanvas-cli: NODECANVAS_PYTHON=$py is not a Python 3.9+ interpreter" >&2
+        exit 2
     fi
-done
-echo "nodecanvas-cli: Python 3.9+ is required" >&2
-exit 2
+else
+    py=
+    for candidate in python3 python3.14 python3.13 python3.12 python3.11 python3.10 python3.9 py python; do
+        if usable "$candidate"; then
+            py=$candidate
+            break
+        fi
+    done
+    if [ -z "$py" ]; then
+        echo "nodecanvas-cli: Python 3.9+ is required (set NODECANVAS_PYTHON to its path)" >&2
+        exit 2
+    fi
+fi
+PYTHONPATH="$src${PYTHONPATH:+:$PYTHONPATH}" exec "$py" -m nodecanvas_cli "$@"

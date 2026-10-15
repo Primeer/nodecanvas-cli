@@ -8,6 +8,8 @@ reader of well-formed code, not a parser; anything it cannot classify is skipped
 
 from __future__ import annotations
 
+import ast
+import operator
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -161,6 +163,17 @@ class ClassDecl:
 
 
 _ENUM_EXPR_RE = re.compile(r"^[\w\s|&<>()~+\-*x0-9A-Fa-f]+$")
+_ENUM_OPS = {
+    ast.BitOr: operator.or_,
+    ast.BitAnd: operator.and_,
+    ast.BitXor: operator.xor,
+    ast.LShift: operator.lshift,
+    ast.RShift: operator.rshift,
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+}
+_ENUM_LIMIT = 1 << 64  # enum underlying types are at most 64-bit
 
 
 def _eval_enum_expr(expr: str, known: Dict[str, int]) -> Optional[int]:
@@ -173,16 +186,51 @@ def _eval_enum_expr(expr: str, known: Dict[str, int]) -> Optional[int]:
     if re.search(r"[A-Za-z_]", re.sub(r"0[xX][0-9A-Fa-f]+", "", e)):
         return None
     try:
-        return int(eval(e, {"__builtins__": {}}, {}))  # noqa: S307 - digits and operators only
-    except Exception:
+        return _eval_int(ast.parse(e, mode="eval").body)
+    except (SyntaxError, ValueError, RecursionError):
         return None
+
+
+def _eval_int(node: ast.AST) -> int:
+    """Integer constant expressions only, with bounded operands (no ``**``, no huge shifts)."""
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        v = node.value
+    elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.Invert, ast.USub, ast.UAdd)):
+        x = _eval_int(node.operand)
+        v = ~x if isinstance(node.op, ast.Invert) else -x if isinstance(node.op, ast.USub) else x
+    elif isinstance(node, ast.BinOp) and type(node.op) in _ENUM_OPS:
+        x, y = _eval_int(node.left), _eval_int(node.right)
+        if isinstance(node.op, (ast.LShift, ast.RShift)) and not 0 <= y < 64:
+            raise ValueError("shift out of range")
+        v = _ENUM_OPS[type(node.op)](x, y)
+    else:
+        raise ValueError("unsupported enum expression")
+    if abs(v) > _ENUM_LIMIT:
+        raise ValueError("enum value out of range")
+    return v
+
+
+_CS_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", "a": "\a", "b": "\b", "f": "\f", "v": "\v"}
+_CS_ESCAPE_RE = re.compile(r"\\(u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|x[0-9A-Fa-f]{1,4}|.)", re.S)
+
+
+def _unescape(s: str) -> str:
+    """Decode C# string escapes; other characters (non-ASCII included) stay as they are."""
+
+    def one(m: "re.Match[str]") -> str:
+        e = m.group(1)
+        if e[0] in "uUx" and len(e) > 1:
+            return chr(int(e[1:], 16))
+        return _CS_ESCAPES.get(e, e)
+
+    return _CS_ESCAPE_RE.sub(one, s)
 
 
 def _first_str(args: Optional[str]) -> Optional[str]:
     if not args:
         return None
     m = _STR_ARG_RE.search(args)
-    return bytes(m.group(1), "utf-8").decode("unicode_escape") if m else None
+    return _unescape(m.group(1)) if m else None
 
 
 def strip_comments_and_strings(src: str) -> Tuple[str, List[str]]:

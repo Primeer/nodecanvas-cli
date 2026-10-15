@@ -216,6 +216,8 @@ def retarget(
     from .bindings import _retarget_fix, assignable, var_type, ws_full
     from .ops import OpError, apply_ops
 
+    if "." not in target.strip(".") or target.endswith("."):
+        raise RefactorError(f"{target!r}: use Type.Method")
     tname, member = target.rsplit(".", 1)
     decl = ws.schema.find(tname) or ws.schema.find_simple(tname.split(".")[-1])
     sigs = [o["params"] for o in ws.schema.overloads(decl.full_name, member, len(to))] if decl else []

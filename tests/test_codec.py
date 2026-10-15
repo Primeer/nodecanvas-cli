@@ -71,3 +71,19 @@ def test_fsjson_preserves_number_text():
 
 def test_fsjson_new_floats():
     assert fsjson.dumps({"x": 1.0, "y": 0.25, "z": 1e-05}) == '{"x":1.0,"y":0.25,"z":1E-05}'
+
+
+def test_folded_lines_never_end_in_a_space():
+    # YAML parsers (Unity, PyYAML) drop trailing spaces of folded lines: "a  b" would read as "a b"
+    rnd = random.Random(7)
+    for _ in range(300):
+        text = "".join(rnd.choice("ab  ") for _ in range(rnd.randint(60, 400))).strip(" ")
+        lines = encode("_serializedGraph", 2, text)
+        assert not any(line.endswith(" ") for line in lines[:-1]), repr(text)
+    lines = encode("_serializedGraph", 2, "x" * 70 + "  b c d")
+    assert lines[0].endswith("x  b") and lines[1] == "    c d'"
+
+
+def test_fsjson_keeps_infinity_and_nan():
+    src = '{"a":Infinity,"b":-Infinity,"c":NaN}'
+    assert fsjson.dumps(fsjson.loads(src)) == src
