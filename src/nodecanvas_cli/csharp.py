@@ -97,6 +97,16 @@ class FieldDecl:
         alias = self.attrs.get("fsSerializeAs") or self.attrs.get("fsProperty")
         return _first_str(alias) or self.name
 
+    @property
+    def doc(self) -> Optional[str]:
+        """The explanation the inspector shows for this field: ``[Tooltip]``."""
+        return _first_str(self.attrs.get("Tooltip"))
+
+    @property
+    def display_name(self) -> Optional[str]:
+        """The label the inspector shows instead of the field name: ``[Name]``."""
+        return _first_str(self.attrs.get("Name"))
+
 
 @dataclass
 class ClassDecl:
@@ -116,6 +126,7 @@ class ClassDecl:
     usings: List[str] = field(default_factory=list)
     const_props: Dict[str, str] = field(default_factory=dict)  # property -> literal it always returns
     setters: List[str] = field(default_factory=list)  # properties with a public set accessor
+    type_params: List[str] = field(default_factory=list)  # names of the generic parameters, in order
 
     @property
     def full_name(self) -> str:
@@ -344,6 +355,13 @@ def _arity(generic: Optional[str]) -> int:
     return len(_split_top(generic.strip()[1:-1], ","))
 
 
+def _type_params(generic: Optional[str]) -> List[str]:
+    """``<in T, U>`` -> ``["T", "U"]``."""
+    if not generic:
+        return []
+    return [p.split()[-1] for p in _split_top(generic.strip()[1:-1], ",") if p.strip()]
+
+
 def _bases(text: Optional[str]) -> List[str]:
     if not text:
         return []
@@ -488,6 +506,7 @@ def scan(src: str, filename: str = "") -> List[ClassDecl]:
                     filename,
                 )
                 decl.usings = usings
+                decl.type_params = _type_params(m_t.group(3))
                 decl.is_abstract = bool(re.search(r"\babstract\b", rest[: m_t.start()]))
                 out.append(decl)
                 stack.append(("type", decl))

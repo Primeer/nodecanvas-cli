@@ -17,9 +17,11 @@ from typing import Any, Dict, List, Optional
 
 from .build import Builder, BuildError
 from .layout import Layouter
-from .lint import ERROR, NESTED_KEYS, lint_graph
-from .model import Graph, GraphError, walk
+from .lint import ERROR, lint_graph
+from .model import NESTED_KEYS, Graph, GraphError, walk
 from .schema import simple_name
+from .typedwalk import prune_refs
+from .typenames import ALIASES
 from .views import render_graph
 
 CHILD_LISTS = {  # lists kept parallel to a node's children, with the element added for a new child
@@ -406,7 +408,41 @@ class Editor:
         if self.g.var_by_name(name) is not None:
             raise OpError(f"variable ${name} already exists")
         var = self.b.new_variable(name, op["type"], op.get("value"), op.get("public", False))
-        self.g.blackboard["_variables"][name] = var
+        items = list(self.g.blackboard["_variables"].items())
+        at = self._var_position(op, items)
+        items.insert(len(items) if at is None else at, (name, var))
+        self.g.blackboard["_variables"] = dict(items)
+
+    def _var_position(self, op: dict, items: List[tuple]) -> Optional[int]:
+        """Where ``after`` / ``before`` / ``index`` put a variable among ``items``; ``None`` when none is given."""
+        given = [k for k in ("after", "before", "index") if k in op]
+        if len(given) > 1:
+            raise OpError(f"give one of after, before, index, not {' and '.join(given)}")
+        if not given:
+            return None
+        if given[0] == "index":
+            index = op["index"]
+            if not isinstance(index, int) or not 0 <= index <= len(items):
+                raise OpError(f"index must be 0..{len(items)}")
+            return index
+        name = str(op[given[0]]).lstrip("$")
+        for i, (key, var) in enumerate(items):
+            if name in (key, var.get("_name")):
+                return i + 1 if given[0] == "after" else i
+        raise OpError(f"no variable or section {name!r}; there are: " + ", ".join(k for k, _ in items))
+
+    def op_var_move(self, op: dict) -> None:
+        var = self.b.var(op["name"])
+        items = list(self.g.blackboard["_variables"].items())
+        entry = next(((k, v) for k, v in items if v is var), None)
+        if entry is None:
+            raise OpError(f"${op['name']} is not on this graph's blackboard")
+        items.remove(entry)
+        at = self._var_position(op, items)
+        if at is None:
+            raise OpError("var-move needs after, before or index")
+        items.insert(at, entry)
+        self.g.blackboard["_variables"] = dict(items)
 
     def op_var_rename(self, op: dict) -> None:
         var = self.b.var(op["name"])
@@ -442,6 +478,8 @@ class Editor:
 
     def op_var_set(self, op: dict) -> None:
         var = self.b.var(op["name"])
+        if "type" in op:
+            self._var_retype(var, op["type"], "value" in op)
         if "value" in op:
             self._var_set_value(var, op["value"])
         if "public" in op:
@@ -450,6 +488,51 @@ class Editor:
                 var["$type"] = var.pop("$type")
             else:
                 var.pop("_isPublic", None)
+
+    def _var_retype(self, var: dict, type_text: str, value_given: bool) -> None:
+        """Change a variable's type in place: its id, and so every reference to it, stays."""
+        from .bindings import var_type
+        from .typedwalk import variable_ref_slots
+
+        name = var.get("_name", "?")
+        old = var_type(var)
+        new = self.b.user_type(type_text)
+        qualified = self.b.types.assembly_qualified(new)
+        new_type = f"NodeCanvas.Framework.Variable`1[[{qualified}]]"
+        was_object = bool(variable_ref_slots(self.ws, var))
+        old_value = var.get("_value")
+        for k in ("_missingType", "_recoveryState"):
+            var.pop(k, None)
+        var.pop("$type", None)
+        var["$type"] = new_type
+        if "_value" in var and not value_given:
+            self._retype_value(var, old_value, new, was_object, name)
+        users = self._var_users(var.get("_id"))
+        if users:
+            shown = self.ws.schema.display_pair(old, new) if old else ("?", new)
+            self.notes.append(f"${name}: type {shown[0]} -> {shown[1]}; used by " + " ".join(users))
+        if var.get("_isPublic") and not self.g.loaded.slot.bound:
+            from .owners import subgraph_parents
+
+            parents = subgraph_parents(self.ws).get(self.g.loaded.slot.path, [])
+            if parents:
+                self.notes.append(f"${name} is public; parent graphs may map it, run lint on: " + ", ".join(parents))
+
+    def _retype_value(self, var: dict, old: Any, new: str, was_object: bool, name: str) -> None:
+        """Keep the stored value when it still means something for the new type, otherwise drop it and say so."""
+        from .typedwalk import variable_ref_slots
+
+        if was_object:
+            if variable_ref_slots(self.ws, var):
+                return  # still an object: the index stays valid
+        elif isinstance(old, (bool, int, float, str)) and new in ALIASES.values():
+            try:
+                self._var_set_value(var, old)
+                return
+            except (BuildError, TypeError, ValueError):
+                pass
+        var.pop("_value", None)
+        self.notes.append(f"${name}: the stored value does not fit the new type and was dropped")
 
     def _var_set_value(self, var: dict, value: Any) -> None:
         from .build import _is_default
@@ -475,9 +558,44 @@ class Editor:
             if not fields:
                 raise OpError(f"#{self.nid(node)} has no subgraph field")
             key = fields[0]
+        old_value = node.get(key)
+        old_ref = self.g.ref(old_value["_value"]) if isinstance(old_value, dict) and "_value" in old_value else None
+        old_sub = self.ws.ref_graph(old_ref) if old_ref is not None and not old_ref.is_null else None
         node[key] = {"_value": self.b.object_ref(op["graph"])} if op.get("graph") else {}
         if "map" in op:
             node["_variablesMap"] = self._mapping(op["graph"], op["map"])
+        elif not op.get("graph"):
+            node.pop("_variablesMap", None)
+        elif node.get("_variablesMap"):
+            new_sub = self.ws.ref_graph(self.g.ref(node[key]["_value"]))
+            if new_sub is not None:
+                self._carry_mapping(node, old_sub, new_sub)
+
+    def _carry_mapping(self, node: dict, old_sub: Optional[Graph], new_sub: Graph) -> None:
+        """Mappings target variable ids of one graph: after a swap, keep the ones the new graph has the same
+        variable for (same name and type) and drop the rest."""
+        old_names = {v.get("_id"): v for v in old_sub.variables.values()} if old_sub is not None else {}
+        new_ids = {v.get("_id") for v in new_sub.variables.values()}
+        kept, dropped = [], []
+        for m in node["_variablesMap"]:
+            sid = m.get("_targetSubGraphVariableID")
+            if sid in new_ids:
+                kept.append(m)
+                continue
+            was = old_names.get(sid)
+            same = new_sub.var_by_name(was.get("_name")) if was is not None else None
+            if same is not None and same.get("$type") == was.get("$type"):
+                m["_targetSubGraphVariableID"] = same.get("_id")
+                kept.append(m)
+            else:
+                dropped.append("$" + was.get("_name", "?") if was is not None else str(sid)[:8])
+        node["_variablesMap"] = kept
+        if dropped:
+            self.notes.append(
+                f"subgraph-set #{self.nid(node)}: {new_sub.name} has no matching variable for mapping(s) "
+                + ", ".join(dropped)
+                + "; removed"
+            )
 
     def op_map(self, op: dict) -> None:
         node = self.node(op["node"])
@@ -690,6 +808,7 @@ OPS = {
     "var-rename": Editor.op_var_rename,
     "var-remove": Editor.op_var_remove,
     "var-set": Editor.op_var_set,
+    "var-move": Editor.op_var_move,
     "subgraph-set": Editor.op_subgraph_set,
     "map": Editor.op_map,
     "set-start": Editor.op_set_start,
@@ -753,6 +872,8 @@ def apply_ops(ws, g: Graph, ops: List[dict]) -> Editor:
     ed.b.normalize(g.nodes)
     ed.b.normalize(g.connections)
     g.renumber()
+    for ref in prune_refs(ws, g):
+        ed.notes.append(f"removed the unused object reference to {ws.ref_display(ref)}")
     return ed
 
 

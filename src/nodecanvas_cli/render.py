@@ -300,7 +300,7 @@ class Renderer:
     def recovered(self, missing: dict) -> Optional[dict]:
         """The object NodeCanvas would restore from a Missing* wrapper, if its type now exists."""
         mt = missing.get("_missingType")
-        if not mt or self.schema is None or not self.schema.resolves(mt):
+        if not mt or self.schema is None or not self.schema.resolves(mt, by_name=True):
             return None
         try:
             from . import fsjson
@@ -310,7 +310,7 @@ class Renderer:
             return None
         if not isinstance(obj, dict):
             return None
-        obj["$type"] = mt
+        obj["$type"] = self.schema.current_name(mt)
         return obj
 
     def _cmp(self, task: dict, field: str, t: str) -> str:

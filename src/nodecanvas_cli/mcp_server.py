@@ -124,17 +124,19 @@ def build_server(project: Optional[str] = None):
 
     @server.tool(annotations=ro)
     def refs(query: str, kind: str = "auto") -> str:
-        """Where a Type.Member, subgraph, $variable or task/node type is used, across all graphs."""
+        """Where a Type.Member, subgraph, $variable or task/node type is used, across all graphs (and, for a graph,
+        fields of other assets)."""
         return cli("refs", query, "--kind", kind)
 
     @server.tool(annotations=ro)
-    def lint(graphs: Optional[List[str]] = None, min_severity: str = "warning") -> str:
-        """Static checks (JSON list of issues): missing types/members/variables/subgraphs, arity, layout, owners."""
-        return cli("lint", *(graphs or []), "--min", min_severity, "--json")
+    def lint(graphs: Optional[List[str]] = None, min_severity: str = "warning", changed: bool = False) -> str:
+        """Static checks (JSON list of issues): missing types/members/variables/subgraphs, arity, layout, owners.
+        changed: only graphs in files changed since HEAD (git) instead of naming them."""
+        return cli("lint", *(graphs or []), "--min", min_severity, *_opt("--changed", changed), "--json")
 
     @server.tool(annotations=ro)
     def types(query: Optional[str] = None, role: Optional[str] = None) -> str:
-        """Task/node types in the project; an exact name prints fields, defaults and enum values.
+        """Task/node types in the project; an exact name prints fields, defaults, enum values and field explanations.
         role: action|condition|bt|composite|decorator|fsm|dt."""
         return cli("types", *([query] if query else []), *_opt("--role", role))
 
@@ -166,8 +168,8 @@ def build_server(project: Optional[str] = None):
 
     @server.tool(annotations=ro)
     def owners(graph: Optional[str] = None) -> str:
-        """GraphOwners (prefabs/scenes) running a graph with their blackboards and exposed overrides;
-        without a graph, a table of every graph (graphs assigned nowhere are flagged)."""
+        """GraphOwners (prefabs/scenes) running a graph with their blackboards and exposed overrides, parent graphs,
+        other assets referencing it; without a graph, a table of every graph (graphs nothing refers to are flagged)."""
         return cli("owners", *([graph] if graph else ["--all"]))
 
     @server.tool(annotations=ro)
@@ -180,8 +182,9 @@ def build_server(project: Optional[str] = None):
         graph: str, ops: List[dict], dry_run: bool = True, force: bool = False, kind: Optional[str] = None
     ) -> str:
         """Apply a batch of edit operations (JSON list, see the ops reference: add, remove, move, wrap, unwrap,
-        replace, set, connect, var-add, map, transition-add, choice-add, ...). Ids refer to the graph before the
-        batch. dry_run defaults to true: it prints the diff without writing; pass dry_run=false to save."""
+        replace, set, connect, var-add, var-move, var-set, map, transition-add, choice-add, ...). Ids refer to the
+        graph before the batch. dry_run defaults to true: it prints the diff without writing; pass dry_run=false
+        to save."""
         return cli(
             "apply",
             graph,
@@ -194,19 +197,21 @@ def build_server(project: Optional[str] = None):
 
     @server.tool(annotations=rw)
     def refactor_rename_member(
-        target: str,
-        new: str,
+        target: Optional[str] = None,
+        new: Optional[str] = None,
+        renames: Optional[List[str]] = None,
         params: Optional[str] = None,
         all_overloads: bool = False,
         graph: Optional[str] = None,
         dry_run: bool = True,
     ) -> str:
-        """Rename Type.OldMember → NewMember in every graph (params picks an overload, e.g. "Unit,Vector3")."""
+        """Rename Type.OldMember → NewMember in every graph (params picks an overload, e.g. "Unit,Vector3").
+        Several at once, in one diff and one save: renames=["Bot.Attack=Strike", "Bot.MoveTo(Unit,Vector3)=Go"]."""
         return cli(
             "refactor",
             "rename-member",
-            target,
-            new,
+            *([f"{target}={new}"] if target is not None and new is not None else []),
+            *(renames or []),
             *_opt("--params", params),
             *_opt("--all-overloads", all_overloads),
             *_opt("--graph", graph),
@@ -304,7 +309,8 @@ def build_server(project: Optional[str] = None):
 
     @server.tool(annotations=ro)
     def verify_unity(graphs: Optional[List[str]] = None, changed: bool = False) -> str:
-        """Load graphs in the open Unity Editor (Unity CLI + com.unity.pipeline) and report NodeCanvas errors."""
+        """Load graphs in the open Unity Editor (Unity CLI + com.unity.pipeline) and report NodeCanvas errors, plus
+        the static type-contract problems Unity cannot see. Waits for an Editor that is reloading scripts."""
         return cli("verify", "--unity", *(graphs or []), *_opt("--changed", changed))
 
     return server

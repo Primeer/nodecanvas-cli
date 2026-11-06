@@ -4,16 +4,17 @@ broken subgraph links, structural arity, unreachable nodes."""
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from .bindings import check_task
-from .model import Graph, walk
-from .schema import short_generic, simple_name
+from .model import NESTED_KEYS, Graph, walk
+from .schema import bare_name, short_generic, simple_name
+from .typerel import ERROR, INFO, REASONS, WARNING, Rel, relation, severity
 
-ERROR, WARNING, INFO = "error", "warning", "info"
-NESTED_KEYS = ("_subTree", "_nestedBT", "_nestedFSM", "_nestedDLG", "_subGraph", "_subFSM", "_subDialogue")
+_LEVELS = {INFO: 0, WARNING: 1, ERROR: 2}
 _SKIP_TYPE_PREFIXES = ("System.", "UnityEngine.", "Unity.")
 
 
@@ -31,6 +32,18 @@ class Issue:
         if self.fix is not None:
             text += "\n          fix: " + json.dumps(self.fix, ensure_ascii=False)
         return text
+
+
+def _renamed_text(renamed) -> str:
+    """``[(saved name, candidates)]`` from ``Schema.renamed`` as a phrase."""
+    parts = []
+    for old, cands in renamed:
+        if len(cands) == 1:
+            parts.append(f"{old} is now {cands[0].full_name}")
+        else:
+            names = ", ".join(c.full_name for c in cands[:3]) + (", …" if len(cands) > 3 else "")
+            parts.append(f"{old} not found, ambiguous: {len(cands)} types named {cands[0].name} ({names})")
+    return "; ".join(parts)
 
 
 def lint_graph(ws, g: Graph) -> List[Issue]:
@@ -54,19 +67,32 @@ def lint_graph(ws, g: Graph) -> List[Issue]:
     def owned():
         return bool(owners_mod.index(ws).owners_of(g))
 
+    def missing(at, label, mt, code, not_found):
+        renamed = schema.renamed(mt)
+        if renamed is None:
+            add(at, ERROR, code, not_found)
+        elif renamed:
+            add(
+                at,
+                WARNING,
+                "stale-type-name",
+                f"{label}: saved as missing {short_generic(mt)}; {_renamed_text(renamed)}, "
+                "NodeCanvas finds it by short name and restores it on load; "
+                "resave in Unity (verify --unity --resave) to store the current name",
+            )
+        else:
+            add(
+                at,
+                INFO,
+                "recoverable-missing",
+                f"{label}: saved as missing {short_generic(mt)}, but the type exists; "
+                "NodeCanvas restores it on load and drops the wrapper on the next save in the editor",
+            )
+
     for vname, v in g.variables.items():
         if "MissingVariableType" in v.get("$type", ""):
             mt = v.get("_missingType", "?")
-            if schema.resolves(mt):
-                add(
-                    "bb",
-                    INFO,
-                    "recoverable-missing",
-                    f"${vname}: saved as missing {short_generic(mt)}, but the type exists; "
-                    "NodeCanvas restores it on load and drops the wrapper on the next save in the editor",
-                )
-            else:
-                add("bb", ERROR, "missing-var-type", f"${vname}: type {short_generic(mt)} not found")
+            missing("bb", f"${vname}", mt, "missing-var-type", f"${vname}: type {short_generic(mt)} not found")
 
     for c in g.connections:
         for k in ("_sourceNode", "_targetNode"):
@@ -80,16 +106,7 @@ def lint_graph(ws, g: Graph) -> List[Issue]:
             t = d.get("$type")
             if t and "Framework.Internal.Missing" in t:
                 mt = d.get("_missingType", "?")
-                if schema.resolves(mt):
-                    add(
-                        at,
-                        INFO,
-                        "recoverable-missing",
-                        f"{simple_name(t)}: saved as missing {short_generic(mt)}, but the type exists; "
-                        "NodeCanvas restores it on load and drops the wrapper on the next save in the editor",
-                    )
-                else:
-                    add(at, ERROR, "missing-type", f"{simple_name(t)}: {short_generic(mt)} not found")
+                missing(at, simple_name(t), mt, "missing-type", f"{simple_name(t)}: {short_generic(mt)} not found")
             elif (
                 t
                 and not t.startswith(_SKIP_TYPE_PREFIXES)
@@ -97,7 +114,17 @@ def lint_graph(ws, g: Graph) -> List[Issue]:
                 and (nc or not t.startswith(("NodeCanvas.", "ParadoxNotion.")))
                 and schema.find(t) is None
             ):
-                add(at, WARNING, "unknown-type", f"{short_generic(t)} not found in project sources")
+                renamed = schema.renamed(t)
+                if renamed:
+                    add(
+                        at,
+                        WARNING,
+                        "stale-type-name",
+                        f"{short_generic(t)}: {_renamed_text(renamed)}, NodeCanvas finds it by short name on load; "
+                        "resave in Unity (verify --unity --resave) to store the current name",
+                    )
+                else:
+                    add(at, WARNING, "unknown-type", f"{short_generic(t)} not found in project sources")
             vid = d.get("_targetVariableID")
             if vid:
                 var = g.var_by_id(vid)
@@ -208,6 +235,8 @@ def lint_graph(ws, g: Graph) -> List[Issue]:
         add(at, sev, code, msg)
     issues.extend(_layout_issues(ws, g, name))
     issues.extend(_variable_contracts(ws, g, name))
+    issues.extend(_bound_param_issues(ws, g, name, external))
+    issues.extend(_stale_object_refs(ws, g, name))
     issues.extend(_asset_name(ws, g, name))
     return issues
 
@@ -318,20 +347,106 @@ def _variable_contracts(ws, g: Graph, name: str) -> List[Issue]:
                     )
                 continue
             pv = g.var_by_id(m.get("_targetVariableID")) if m.get("_targetVariableID") else None
-            if pv is not None and var_type(pv) and var_type(sv) and var_type(pv) != var_type(sv):
-                from .views import var_type as shown_type
-
-                out.append(
-                    Issue(
-                        name,
-                        f"#{g.nid(n)}",
-                        WARNING,
-                        "mapping-type-mismatch",
-                        f"{sub.name}.${sname} ({shown_type(sv, ws.schema)}) is mapped to "
-                        f"${pv.get('_name')} ({shown_type(pv, ws.schema)})",
-                    )
-                )
+            issue = _mapping_issue(ws, sub, sname, sv, pv, m) if pv is not None else None
+            if issue is not None:
+                out.append(Issue(name, f"#{g.nid(n)}", issue[0], "mapping-type-mismatch", issue[1]))
     return out
+
+
+def _mapping_issue(ws, sub: Graph, sname: str, sv: dict, pv: dict, m: dict) -> Optional[Tuple[str, str]]:
+    """The worse direction of one mapping: a value passed in (parent -> subgraph) and one read back."""
+    from .bindings import var_type
+    from .views import var_type as shown_type
+
+    st, pt = var_type(sv), var_type(pv)
+    if not st or not pt:
+        return None
+    flows = []
+    if m.get("_canWrite") or not m.get("_canRead"):
+        flows.append((pt, st))
+    if m.get("_canRead"):
+        flows.append((st, pt))
+    worst = None
+    for src, dst in flows:
+        rel = relation(ws.schema, src, dst)
+        level = severity(rel, src, dst) or (INFO if rel is Rel.UNKNOWN else None)
+        if level is not None and (worst is None or _LEVELS[level] > _LEVELS[worst[0]]):
+            worst = (level, rel)
+    if worst is None:
+        return None
+    shown_s, shown_p = shown_type(sv, ws.schema), shown_type(pv, ws.schema)
+    if shown_s == shown_p:
+        shown_s, shown_p = bare_name(st), bare_name(pt)
+    text = f"{sub.name}.${sname} ({shown_s}) is mapped to ${pv.get('_name')} ({shown_p})"
+    reason = REASONS.get(worst[1])
+    return worst[0], f"{text}: {reason}" if reason else text
+
+
+def _bound_param_issues(ws, g: Graph, name: str, external) -> List[Issue]:
+    """Parameters of tasks and nodes against the variables bound to them, with generic types substituted:
+    ``SetVariable<A.Pawn>`` holding a variable of ``B.Pawn``. Reflection arguments are ``check_task``'s."""
+    from .bindings import var_type as value_type
+    from .typedwalk import bound_params, is_write_field
+
+    out: List[Issue] = []
+    for owner in list(g.nodes) + list(g.connections):
+        for p in bound_params(ws, owner):
+            if not p.expected or "_variablesMap" in p.path or "parameters" in p.path:
+                continue
+            d = p.param
+            var = g.var_by_id(d["_targetVariableID"])
+            if var is None:
+                ext = external().get((d["_targetVariableID"], d.get("_name")))
+                var = ext.var if ext is not None else None
+            vt = value_type(var) if var is not None else None
+            if not vt:
+                continue
+            write = is_write_field(p.field, p.owner_type)
+            src, dst = (p.expected, vt) if write else (vt, p.expected)
+            rel = relation(ws.schema, src, dst)
+            level = severity(rel, src, dst)
+            if level is None:
+                continue
+            shown_e, shown_v = ws.schema.display_pair(p.expected, vt)
+            field = next((x for x in reversed(p.path) if isinstance(x, str)), "?")
+            where = f"{ws.schema.display(p.owner_type)}.{field}" if p.owner_type else field
+            verb = f"stores {shown_e} into" if write else f"expects {shown_e}, bound to"
+            out.append(
+                Issue(
+                    name,
+                    g.owner_label(owner),
+                    level,
+                    "param-type-mismatch",
+                    f"{where} {verb} ${var.get('_name')} ({shown_v}): {REASONS[rel]}",
+                )
+            )
+    return out
+
+
+def _stale_object_refs(ws, g: Graph, name: str) -> List[Issue]:
+    from .typedwalk import stale_refs
+
+    return [
+        Issue(
+            name,
+            "refs",
+            WARNING,
+            "stale-object-ref",
+            f"{g.loaded.slot.refs_key}[{i}] points to {ws.ref_display(g.refs[i])}, which nothing in the graph uses; "
+            "the asset stays a build dependency (the next nodecanvas-cli or Unity save removes the entry)",
+        )
+        for i in stale_refs(ws, g)
+    ]
+
+
+# Static checks `verify --unity` reports next to what the Editor says: Unity cannot see these, because the types
+# convert (through GetComponent, say) and the result is only wrong at run time.
+TYPE_CONTRACTS = {"mapping-type-mismatch", "param-type-mismatch", "arg-type-mismatch"}
+
+
+def static_issues(ws, g: Graph) -> List[Issue]:
+    """Every error of ``lint_graph`` and the warnings about type contracts."""
+    return [i for i in lint_graph(ws, g) if i.severity == ERROR or (i.severity == WARNING and i.code in TYPE_CONTRACTS)]
 
 
 NODE_MIN_SIZE = (80.0, 20.0)  # NodeCanvas editor: smallest node rect, so closer nodes always overlap
@@ -392,11 +507,18 @@ def _int(v: Optional[str]) -> Optional[int]:
 
 
 def cmd_lint(ws, a) -> int:
-    graphs = (
-        [ws.graph(q, a.kind) for q in a.graphs]
-        if a.graphs
-        else [g for g in ws.all_graphs() if a.kind is None or g.kind == a.kind]
-    )
+    if a.changed and a.graphs:
+        print("error: name graphs or pass --changed, not both", file=sys.stderr)
+        return 2
+    if a.changed:
+        graphs = [g for g in map(ws.load, ws.changed_slots()) if a.kind is None or g.kind == a.kind]
+        if not graphs:
+            print("[]" if a.json else "no changed graphs (git diff HEAD + untracked files)")
+            return 0
+    elif a.graphs:
+        graphs = [ws.graph(q, a.kind) for q in a.graphs]
+    else:
+        graphs = [g for g in ws.all_graphs() if a.kind is None or g.kind == a.kind]
     issues: List[Issue] = []
     if not ws.schema.has_nodecanvas:
         issues.append(
@@ -410,7 +532,7 @@ def cmd_lint(ws, a) -> int:
         )
     for g in graphs:
         issues.extend(lint_graph(ws, g))
-    if not a.graphs:
+    if not a.graphs and not a.changed:
         from .owners import index
 
         for o in index(ws).owners:
@@ -424,8 +546,8 @@ def cmd_lint(ws, a) -> int:
                         f"{o.cls} has no graph assigned and no bound graph",
                     )
                 )
-    levels = {INFO: 0, WARNING: 1, ERROR: 2}
-    issues = [i for i in issues if levels[i.severity] >= levels[a.min]]
+    hidden = {s: sum(1 for i in issues if i.severity == s and _LEVELS[s] < _LEVELS[a.min]) for s in (WARNING, INFO)}
+    issues = [i for i in issues if _LEVELS[i.severity] >= _LEVELS[a.min]]
     if a.json:
         print(json.dumps([i.__dict__ for i in issues], ensure_ascii=False, indent=1))
     else:
@@ -436,13 +558,19 @@ def cmd_lint(ws, a) -> int:
                 print(cur)
             print("  " + i.line())
         counts = {s: sum(1 for i in issues if i.severity == s) for s in (ERROR, WARNING, INFO)}
-        print(f"{len(graphs)} graphs: {counts[ERROR]} errors, {counts[WARNING]} warnings, {counts[INFO]} info")
+        summary = f"{len(graphs)} graphs: {counts[ERROR]} errors, {counts[WARNING]} warnings, {counts[INFO]} info"
+        hid = [f"{n} {s}{'s' if s == WARNING and n != 1 else ''}" for s, n in hidden.items() if n]
+        if hid:
+            low = INFO if hidden[INFO] else WARNING
+            summary += f" ({', '.join(hid)} hidden, --min {low} to show)"
+        print(summary)
     return 1 if any(i.severity == ERROR for i in issues) else 0
 
 
 def register(sub) -> None:
     s = sub.add_parser("lint", help="check graphs for broken references and structural problems")
     s.add_argument("graphs", nargs="*", help="graphs to check (default: all)")
+    s.add_argument("--changed", action="store_true", help="only graphs in files changed since HEAD (git)")
     s.add_argument("--min", choices=[INFO, WARNING, ERROR], default=WARNING, help="lowest severity to report")
     s.add_argument("--kind", choices=["bt", "fsm", "dt"], help="only graphs of this kind")
     s.add_argument("--json", action="store_true")

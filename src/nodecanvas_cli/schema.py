@@ -10,15 +10,19 @@ from __future__ import annotations
 import re
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from .csharp import ClassDecl, FieldDecl, scan
 from .project import Cache, Project
 
-DECL_FORMAT = 6
+DECL_FORMAT = 7
 _DECL_NAMES_RE = re.compile(rb"\b(?:class|struct|enum|interface|record)\s+@?(\w+)")
 _GENERIC_ARGS_RE = re.compile(r"`(\d+)\[\[.*\]\]$")
 
+# Printed by their short name even if the project declares a type with the same name.
+_NEVER_FULL = {
+    f"System.{n}" for n in ("Boolean", "Single", "Double", "Int32", "Int64", "String", "Byte", "Char", "UInt32")
+}
 # Roots of the NodeCanvas type hierarchy, by simple name.
 ROLE_ROOTS = {
     "ActionTask": "action",
@@ -78,6 +82,32 @@ def _strip_assembly(qualified: str) -> str:
         elif ch == "," and depth == 0:
             return qualified[:k].strip()
     return qualified.strip()
+
+
+def bare_name(t: str) -> str:
+    """Full type name without assembly qualifiers, also inside generic arguments."""
+    args = generic_args(t)
+    if not args:
+        return _strip_assembly(t)
+    return t[: t.find("[")] + "[" + ",".join(f"[{bare_name(a)}]" for a in args) + "]"
+
+
+def generic_text_args(text: str) -> List[str]:
+    """``Foo<A, List<B>>`` -> ``["A", "List<B>"]`` (C# syntax, top-level commas only)."""
+    if "<" not in text or not text.rstrip().endswith(">"):
+        return []
+    body = text[text.index("<") + 1 : text.rindex(">")]
+    out, depth, cur = [], 0, ""
+    for ch in body:
+        depth += ch == "<"
+        depth -= ch == ">"
+        if ch == "," and depth == 0:
+            out.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    out.append(cur.strip())
+    return [x for x in out if x]
 
 
 def simple_name(type_name: str) -> str:
@@ -187,6 +217,7 @@ class Schema:
                     "attrs": dict(d.attrs),
                     "usings": list(d.usings),
                     "setters": list(d.setters),
+                    "type_params": list(d.type_params),
                 }
             )
             self._by_full[d.full_name] = merged
@@ -228,9 +259,44 @@ class Schema:
         cands = [c for c in cands if arity is None or c.arity == arity]
         return cands[0] if len(cands) == 1 else None
 
+    def lookup(self, text: str, arity: Optional[int] = None) -> List[ClassDecl]:
+        """Every declaration a name typed by a person can mean: ``Pawn``, ``Pawns.Pawn``, ``Ns.Outer.Inner``,
+        ``Ns.Outer+Inner``. A qualifier must match whole namespace parts; an exact full name wins."""
+        t = text.strip().replace("+", ".")
+        if "`" in t:
+            t, _, n = t.partition("`")
+            arity = int(n.split("[")[0]) if arity is None else arity
+
+        def dotted(c: ClassDecl) -> str:
+            return c.full_name.split("`")[0].replace("+", ".")
+
+        simple = t.rsplit(".", 1)[-1]
+        for pool in (self._load_simple(simple), self._builtin_simple.get(simple, [])):
+            hits = [
+                c
+                for c in pool
+                if (arity is None or c.arity == arity) and (dotted(c) == t or dotted(c).endswith("." + t))
+            ]
+            if hits:
+                exact = [c for c in hits if dotted(c) == t]
+                return exact or hits
+        return []
+
+    def visible(self, decl: ClassDecl, context: ClassDecl) -> bool:
+        """Whether code inside ``context`` can name ``decl`` without a qualifier."""
+        ns = context.namespace
+        while ns:
+            if decl.namespace == ns:
+                return True
+            ns = ns.rsplit(".", 1)[0] if "." in ns else ""
+        return not decl.namespace or decl.namespace in context.usings
+
     def find_simple(
         self, name: str, context: Optional[ClassDecl] = None, arity: Optional[int] = None
     ) -> Optional[ClassDecl]:
+        """The declaration C# code inside ``context`` means by ``name``: nested types first, then the namespaces
+        from the innermost outwards, then usings. Without a context, or when none of these match, the first
+        declaration of that name: names typed by a person go through ``lookup`` and ``TypeNames.user`` instead."""
         cands = [c for c in self._load_simple(name) if arity is None or c.arity == arity]
         if not cands:
             cands = [c for c in self._builtin_simple.get(name, []) if arity is None or c.arity == arity]
@@ -245,33 +311,79 @@ class Schema:
             ]
             if nested:
                 return nested[0]
-            visible = {context.namespace, *context.usings}
             ns = context.namespace
-            while "." in ns:
-                ns = ns.rsplit(".", 1)[0]
-                visible.add(ns)
-            same_ns = [c for c in cands if c.namespace == context.namespace]
-            if same_ns:
-                return same_ns[0]
-            in_scope = [c for c in cands if c.namespace in visible]
+            while ns:
+                here = [c for c in cands if c.namespace == ns]
+                if here:
+                    return here[0]
+                ns = ns.rsplit(".", 1)[0] if "." in ns else ""
+            in_scope = [c for c in cands if c.namespace in context.usings]
             if in_scope:
                 return in_scope[0]
         return cands[0]
 
-    def base_of(self, decl: ClassDecl) -> Optional[ClassDecl]:
+    def resolve_base(self, decl: ClassDecl, base: str) -> Optional[ClassDecl]:
+        """The declaration of one entry of ``decl``'s base list; ``None`` when it is outside the sources."""
         from .builtin import BUILTIN_FILE
 
+        bare = re.sub(r"<.*>", "", base).strip()
+        name = bare.split(".")[-1]
+        arity = len(generic_text_args(base))
+        if "." in bare:
+            hits = self.lookup(bare, arity)
+            if len(hits) == 1:
+                return hits[0]
+        if decl.file == BUILTIN_FILE:
+            found = next((c for c in self._builtin_simple.get(name, []) if c.arity == arity), None)
+            if found is not None:
+                return found
+        return self.find_simple(name, decl, arity)
+
+    def base_of(self, decl: ClassDecl) -> Optional[ClassDecl]:
         for b in decl.bases:
-            name = re.sub(r"<.*>", "", b).split(".")[-1].strip()
-            arity = len(re.findall(r",", b.split("<", 1)[1])) + 1 if "<" in b else 0
-            found = None
-            if decl.file == BUILTIN_FILE:
-                found = next((c for c in self._builtin_simple.get(name, []) if c.arity == arity), None)
-            if found is None:
-                found = self.find_simple(name, decl, arity)
+            found = self.resolve_base(decl, b)
             if found is not None and found.kind in ("class", "record", "struct"):
                 return found
         return None
+
+    def ancestors(self, decl: ClassDecl) -> Tuple[Set[str], Set[str]]:
+        """Full names of ``decl``, its base classes and interfaces in the sources, and the short names of the
+        bases outside the sources (``MonoBehaviour``, a package's base class)."""
+        known: Set[str] = set()
+        external: Set[str] = set()
+        stack = [decl]
+        while stack:
+            c = stack.pop()
+            if c.full_name in known:
+                continue
+            known.add(c.full_name)
+            for b in c.bases:
+                found = self.resolve_base(c, b)
+                if found is not None:
+                    stack.append(found)
+                else:
+                    external.add(re.sub(r"<.*>", "", b).strip().split(".")[-1])
+        return known, external
+
+    def display(self, type_name: str) -> str:
+        """A readable name that does not mislead: ``SetVariable<Pawn>``, with the full name of every part
+        whose short name is shared by several types of the project."""
+        t = _strip_assembly(type_name) if "[" not in type_name.split("`")[0] else type_name
+        key = _type_key(t)
+        args = generic_args(t)
+        base = simple_name(key)
+        arity = int(key.split("`")[1]) if "`" in key else 0
+        if key not in _NEVER_FULL:
+            cands = [c for c in self._load_source_simple(base) if c.arity == arity]
+            outside = key.startswith(("System.", "UnityEngine.")) and any(c.full_name != key for c in cands)
+            if len(cands) > 1 or outside:
+                base = key.split("`")[0]
+        return f"{base}<{', '.join(self.display(a) for a in args)}>" if args else base
+
+    def display_pair(self, a: str, b: str) -> Tuple[str, str]:
+        """``display`` of two types that are about to be compared in a message: full names when these look alike."""
+        da, db = self.display(a), self.display(b)
+        return (bare_name(a), bare_name(b)) if da == db else (da, db)
 
     def chain(self, decl: ClassDecl) -> List[ClassDecl]:
         out, cur, guard = [], decl, 0
@@ -370,19 +482,47 @@ class Schema:
                     out.append(o)
         return out
 
-    def resolves(self, type_name: str) -> bool:
+    def resolves(self, type_name: str, by_name: bool = False) -> bool:
         """Whether a (possibly generic, assembly-qualified) CLR type name can be found now.
 
-        ``System.*`` / ``UnityEngine.*`` / ``Unity.*`` types are assumed to exist.
+        ``System.*`` / ``UnityEngine.*`` / ``Unity.*`` types are assumed to exist. With ``by_name``,
+        a type missing under its full name also counts when its short name exists, as NodeCanvas
+        resolves it on load (see ``renamed``).
         """
+        return self._resolve(type_name, by_name, [])
+
+    def renamed(self, type_name: str) -> Optional[List[Tuple[str, List[ClassDecl]]]]:
+        """Parts of ``type_name`` that only resolve by short name: ``[(saved name, candidates)]``.
+
+        NodeCanvas (``ReflectionTools.GetType``) falls back to a lookup that ignores the namespace
+        when a serialized type name is not found, so a type whose namespace changed still loads.
+        ``None`` when the name does not resolve even that way.
+        """
+        out: List[Tuple[str, List[ClassDecl]]] = []
+        return out if self._resolve(type_name, True, out) else None
+
+    def current_name(self, type_name: str) -> str:
+        """``type_name`` with renamed parts replaced by the type NodeCanvas finds (when unambiguous)."""
+        for old, cands in self.renamed(type_name) or []:
+            if len(cands) == 1:
+                type_name = type_name.replace(old, cands[0].full_name)
+        return type_name
+
+    def _resolve(self, type_name: str, by_name: bool, renamed: list) -> bool:
         base = _strip_assembly(type_name) if "[" not in type_name.split("`")[0] else type_name
         key = _type_key(base)
         if not key.startswith(("System.", "UnityEngine.", "Unity.")):
             if key.startswith(("NodeCanvas.", "ParadoxNotion.")) and not self.has_nodecanvas:
                 pass
             elif self.find(key) is None:
-                return False
-        return all(self.resolves(a) for a in generic_args(type_name))
+                if not by_name:
+                    return False
+                arity = int(key.split("`")[1]) if "`" in key else 0
+                cands = [c for c in self._load_simple(simple_name(key)) if c.arity == arity]
+                if not cands:
+                    return False
+                renamed.append((key, cands))
+        return all(self._resolve(a, by_name, renamed) for a in generic_args(type_name))
 
     def const_prop(self, type_name: str, prop: str) -> Optional[str]:
         decl = self.find(type_name)
@@ -441,6 +581,12 @@ class Schema:
                         out.append(full)
         cache.prune(seen)
         cache.save()
+        known = {d.full_name for d in out}
+        out += [
+            d
+            for d in self._builtin_full.values()
+            if d.full_name not in known and d.kind == "class" and not d.is_abstract and self.role(d.full_name) in roles
+        ]
         return out
 
 

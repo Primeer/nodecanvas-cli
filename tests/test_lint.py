@@ -285,3 +285,79 @@ def test_asset_name_must_match_file_name(ncg, project):
     assert "'Patrol_BT'" in issues[0]["message"] and "'Guard_BT'" in issues[0]["message"]
     assert ncg("new", "Assets/Graphs/Fresh_BT.asset", "--kind", "bt")[0] == 0
     assert "name-mismatch" not in ncg("lint", "Fresh_BT", "--json")[1]
+
+
+def _stale_namespaces(project, teleport=True):
+    """Broken_BT with ``$Self`` and the Missing task saved under a namespace that no longer exists."""
+    asset = project / "Assets/Graphs/Broken_BT.asset"
+    text = asset.read_text()
+    text = text.replace(
+        '"$type":"NodeCanvas.Framework.Variable`1[[Demo.Game.Bot,',
+        '"_missingType":"NodeCanvas.Framework.Variable`1[[Demo.Old.Bot,',
+    ).replace(
+        'PublicKeyToken=null]]"}}},"derivedData"',
+        'PublicKeyToken=null]]","$type":"NodeCanvas.Framework.Internal.MissingVariableType"}}},"derivedData"',
+    )
+    asset.write_text(text.replace('"_missingType":"Demo.Game.Teleport"', '"_missingType":"Demo.Old.Teleport"'))
+    if teleport:
+        cs = project / "Assets/Game/Bot.cs"
+        cs.write_text(
+            cs.read_text().rstrip()[:-1] + "\n    public class Teleport : NodeCanvas.Framework.ActionTask { }\n}\n"
+        )
+
+
+def test_type_found_by_short_name_is_a_stale_name_not_an_error(ncg, project):
+    # NodeCanvas resolves a type missing under its full name by its short name (namespace changed)
+    _stale_namespaces(project)
+    _, out, _ = ncg("lint", "Broken_BT", "--json", "--min", "info")
+    issues = {(i["at"], i["code"]): i for i in json.loads(out)}
+    assert issues[("bb", "stale-type-name")]["severity"] == "warning"
+    assert "Demo.Old.Bot is now Demo.Game.Bot" in issues[("bb", "stale-type-name")]["message"]
+    assert issues[("#6", "stale-type-name")]["severity"] == "warning"
+    assert not any(code in ("missing-var-type", "missing-type") for _, code in issues)
+    _, out, _ = ncg("vars", "Broken_BT")
+    assert "Bot(recovered)" in out
+
+
+def test_short_name_fallback_reports_ambiguity(ncg, project):
+    _stale_namespaces(project, teleport=False)
+    (project / "Assets/Game/Other.cs").write_text("namespace Demo.Other\n{\n    public class Bot { }\n}\n")
+    _, out, _ = ncg("lint", "Broken_BT", "--json")
+    stale = next(i for i in json.loads(out) if i["code"] == "stale-type-name")
+    assert "ambiguous: 2 types named Bot" in stale["message"]
+
+
+def test_summary_counts_hidden_issues(ncg, project):
+    _, out, _ = ncg("lint", "Broken_BT", "--min", "error")
+    assert out.strip().splitlines()[-1].endswith("0 warnings, 0 info (1 warning, 1 info hidden, --min info to show)")
+    _, out, _ = ncg("lint", "Broken_BT", "--min", "info")
+    assert "hidden" not in out
+
+
+def test_lint_changed(ncg, project):
+    import subprocess
+
+    def run(*a):
+        return subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=project, check=True, capture_output=True
+        )
+
+    run("init", "-q")
+    run("add", "-A")
+    run("commit", "-qm", "base")
+    code, out, _ = ncg("lint", "--changed")
+    assert code == 0 and "no changed graphs" in out
+    code, out, _ = ncg("lint", "--changed", "--json")
+    assert code == 0 and json.loads(out) == []
+    (project / "ops.json").write_text('[{"op": "set", "node": "1", "path": "_position", "value": [0, 160]}]')
+    assert ncg("apply", "Sentry", project / "ops.json")[0] == 0
+    code, out, _ = ncg("lint", "--changed")
+    assert code == 0 and "1 graphs:" in out
+    assert "Bot_BT" not in out and "owner-missing-graph" not in out
+    code, out, _ = ncg("lint", "--changed", "--kind", "fsm")
+    assert code == 0 and "no changed graphs" in out  # Sentry's bound graph is a BT
+
+
+def test_lint_changed_with_names_is_an_error(ncg):
+    code, _, err = ncg("lint", "--changed", "Bot_BT")
+    assert code == 2 and "not both" in err

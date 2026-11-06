@@ -49,7 +49,8 @@ vars: Self:Bot(pub)  Target:Unit  Alert:bool  Cool time:float  Speed:float
   transitions in, dialogue choices), the same for every call of a member or write of a variable, and
   graph statistics.
 - **owners / blackboards** — which prefabs and scenes run a graph (GraphOwner components, exposed
-  variable overrides, owner blackboards), graphs assigned nowhere, and Blackboard / GlobalBlackboard /
+  variable overrides, owner blackboards), which other assets point at it (a field of a ScriptableObject, say),
+  graphs nothing refers to, and Blackboard / GlobalBlackboard /
   AssetBlackboard contents; lint checks global variables and owner overrides against them.
 - **types / members** — discover task and node types with their fields, defaults and enum members, and the
   properties/methods reflection tasks can call.
@@ -123,12 +124,13 @@ nodecanvas-cli why <graph> <node> [--expand]       # conditions on the way from 
 nodecanvas-cli paths [graph] --to <Type.Member | $Var> [--reads]
 nodecanvas-cli stats [graph] [--json]
 nodecanvas-cli scaffold action|condition|decorator|composite <Name> --dir Assets/... [--field "x:BBParameter<float>=1"]
-nodecanvas-cli owners [<graph> | --all]            # GraphOwners in prefabs/scenes, parent graphs
+nodecanvas-cli owners [<graph> | --all]            # GraphOwners in prefabs/scenes, parent graphs, other assets
 nodecanvas-cli blackboards [--global]
-nodecanvas-cli lint [graph...] [--min info|warning|error] [--json]
+nodecanvas-cli lint [graph... | --changed] [--min info|warning|error] [--json]
 nodecanvas-cli types [query] [--role action|condition|bt|composite|decorator|fsm|dt]
 nodecanvas-cli members <Type> [filter]
 nodecanvas-cli refactor rename-member|rename-type|retarget ... [--dry-run]
+nodecanvas-cli refactor rename-member Type.Old=New [Type.Old(P1,P2)=New ...] [--file pairs.txt]
 nodecanvas-cli new <path.asset> --kind bt|fsm|dt [--var "Name:type[=value][:pub]"]
 nodecanvas-cli extract <graph> <node> <new.asset> | inline <graph> <node> | copy <src> <node> <dst> <parent>
 nodecanvas-cli apply <graph> <ops.json | -> [--dry-run] [--force]

@@ -15,6 +15,7 @@ from . import fsjson
 from .container import ObjectRef, UnityFile
 from .model import BT, DT, FSM, Graph, walk
 from .schema import generic_args, simple_name
+from .typedwalk import is_write_field, node_ref_slots, prune_refs, variable_ref_slots
 from .views import render_graph
 from .yamlscalar import encode
 
@@ -23,21 +24,6 @@ DERIVED = {
     "bt": {"repeat": True, "$type": BT + "+DerivedSerializationData"},
     "fsm": None,
     "dt": {"actorParameters": [], "$type": DT + "+DerivedSerializationData"},
-}
-NESTED_KEYS = ("_subTree", "_nestedBT", "_nestedFSM", "_nestedDLG", "_subGraph")
-WRITE_FIELDS = {
-    "saveAs",
-    "returnValue",
-    "current",
-    "storeIndex",
-    "boolVariable",
-    "floatVariable",
-    "intVariable",
-    "saveIndexAs",
-    "saveDistanceAs",
-    "saveObjectAs",
-    "savePositionAs",
-    "saveTo",
 }
 META = (
     "fileFormatVersion: 2\nguid: {guid}\nNativeFormatImporter:\n  externalObjects: {{}}\n"
@@ -205,7 +191,7 @@ def used_variables(g: Graph, nodes: List[dict]) -> Dict[str, str]:
                 continue
             key = path[-1] if path else ""
             owner_type = _owner_type(n, path)
-            write = key in WRITE_FIELDS or (key == "valueA" and simple_name(owner_type).startswith("Set"))
+            write = is_write_field(key, owner_type)
             if isinstance(key, int) and len(path) >= 2 and path[-2] == "_variablesMap":
                 write = bool(d.get("_canRead"))
             mode = out.get(vid, "")
@@ -223,54 +209,18 @@ def _owner_type(node: dict, path: Tuple) -> str:
 
 
 def object_ref_slots(ws, g: Graph, node: dict) -> List[Tuple[Any, Any]]:
-    """``(container, key)`` of every int in ``node`` that indexes the graph's ``_objectReferences``:
-    fields of a UnityEngine.Object type (also inside BBParameters, lists, nested classes and tasks),
-    found by the field types in the sources."""
-    from .render import _bb_inner, _elem_type
+    """``(container, key)`` of every int in ``node`` that indexes the graph's ``_objectReferences``."""
+    return node_ref_slots(ws, node)
 
-    schema, r = ws.schema, ws.renderer(g)
-    out: Dict[Tuple[int, Any], Tuple[Any, Any]] = {}
 
-    def is_object(t: Optional[str], ctx) -> bool:
-        return bool(t) and "<" not in t and not t.endswith("[]") and r._is_unity_object(t, ctx)
-
-    def visit(v: Any, t: Optional[str], ctx, holder: Any, key: Any) -> None:
-        if isinstance(v, bool) or v is None:
-            return
-        if isinstance(v, int):
-            if is_object(t, ctx):
-                out[(id(holder), key)] = (holder, key)
-            return
-        if isinstance(v, list):
-            et = _elem_type(t)
-            for i, x in enumerate(v):
-                visit(x, et, ctx, v, i)
-            return
-        if not isinstance(v, dict):
-            return
-        if "$content" in v:
-            visit(v["$content"], v.get("$type") or t, ctx, v, "$content")
-            return
-        if "_value" in v and (_bb_inner(t) or "_type" in v or (t or "").startswith("BBObjectParameter")):
-            if not (v.get("_name") or v.get("_targetVariableID")):
-                inner = v.get("_type") or _bb_inner(t)
-                visit(v["_value"], inner.split(",")[0] if inner else None, ctx, v, "_value")
-            return
-        dt = v.get("$type") or t
-        decl = schema.find(dt) if dt else None
-        if decl is None and dt:
-            decl = schema.find_simple(simple_name(dt).split("<")[0], ctx)
-        fields = {n: (f, c) for n, f, c in schema.ordered_fields(decl.full_name)} if decl is not None else {}
-        for k, x in v.items():
-            f = fields.get(k)
-            visit(x, f[0].type if f else None, f[1] if f else ctx, v, k)
-
-    visit(node, None, None, None, None)
-    for k in NESTED_KEYS:  # subgraph references, even when the node type is not in the sources
-        v = node.get(k)
-        if isinstance(v, dict) and isinstance(v.get("_value"), int):
-            out[(id(v), "_value")] = (v, "_value")
-    return list(out.values())
+def copy_variable(ws, src: Graph, dst: Graph, var: dict) -> dict:
+    """A deep copy of a blackboard variable for ``dst``; an object value keeps pointing at the same object."""
+    nv = copy.deepcopy(var)
+    if src is not dst:
+        for holder, key in variable_ref_slots(ws, nv):
+            ref = src.ref(holder[key])
+            holder[key] = dst.ref_index(ref) if ref is not None and not ref.is_null else 0
+    return nv
 
 
 def clone(
@@ -363,6 +313,7 @@ def _finish(ws, a, created: List[Tuple[UnityFile, Graph, str]], changed: List[Gr
         print("dry run: nothing written")
         return 0
     for f, g, guid in created:
+        prune_refs(ws, g)
         f.store(g.loaded)
         f.abspath.parent.mkdir(parents=True, exist_ok=True)
         f.dirty = True
@@ -429,9 +380,10 @@ def cmd_extract(ws, a) -> int:
     var_map: Dict[str, dict] = {}
     for name, v in g.variables.items():
         if v.get("_id") in usage:
-            nv = {k: copy.deepcopy(x) for k, x in v.items() if k not in ("_isPublic", "$type")}
+            nv = copy_variable(ws, g, sub, v)
+            nv.pop("_isPublic", None)
             nv["_isPublic"] = True
-            nv["$type"] = v["$type"]
+            nv["$type"] = nv.pop("$type")
             sub.blackboard["_variables"][name] = nv
             var_map[v["_id"]] = nv
     copies, conns = clone(ws, g, sub, nodes, var_map)
@@ -502,7 +454,8 @@ def cmd_inline(ws, a) -> int:
         new_name = name
         while g.var_by_name(new_name) is not None:
             new_name = f"{new_name} ({sub.name})"
-        nv = {k: copy.deepcopy(x) for k, x in v.items() if k not in ("_isPublic",)}
+        nv = copy_variable(ws, sub, g, v)
+        nv.pop("_isPublic", None)
         nv["_name"] = new_name
         nv["_id"] = v["_id"] if g.var_by_id(v["_id"]) is None else str(uuid.uuid4())
         g.blackboard["_variables"][new_name] = nv
@@ -580,7 +533,7 @@ def copy_subtree(
     if as_root and dst.nodes and dst.kind == "bt":
         raise AssetError(f"{dst.name} already has a root; give a parent node to attach the copy to")
     for v in missing:
-        nv = copy.deepcopy(v)
+        nv = copy_variable(ws, src, dst, v)
         nv.pop("_isPublic", None)
         if public_vars(v["_name"]) if callable(public_vars) else public_vars:
             nv["_isPublic"] = True

@@ -117,22 +117,38 @@ namespace NodeCanvas.BehaviourTrees
         [SerializeField] private BBParameter<BehaviourTree> _subTree = null;
     }
 
-    public class Sequencer : BTComposite { public bool dynamic; public bool random; }
-    public class Selector : BTComposite { public bool dynamic; public bool random; }
+    public class Sequencer : BTComposite
+    {
+        [Tooltip("Re-checks earlier children every tick; if one fails, stops the running child and fails.")]
+        public bool dynamic;
+        [Tooltip("The children run in a new random order after each reset.")]
+        public bool random;
+    }
+    public class Selector : BTComposite
+    {
+        [Tooltip("Re-checks earlier children every tick; if one succeeds, stops the running child and succeeds.")]
+        public bool dynamic;
+        [Tooltip("The children run in a new random order after each reset.")]
+        public bool random;
+    }
     [Name("Step Sequencer")] public class StepIterator : BTComposite { }
     [Name("Parallel")] public class Parallel : BTComposite
     {
         public enum ParallelPolicy { FirstFailure = 0, FirstSuccess = 1, FirstSuccessOrFailure = 2 }
+        [Tooltip("Which child results end the Parallel node and decide its status.")]
         public ParallelPolicy policy = ParallelPolicy.FirstFailure;
+        [Name("Repeat"), Tooltip("Children that finish run again until the policy is met or all have finished once.")]
         public bool dynamic;
     }
     public class ProbabilitySelector : BTComposite
     {
         [AutoSortWithChildrenConnections] public List<BBParameter<float>> childWeights;
+        [Tooltip("Chance that the node fails right away without running a child.")]
         public BBParameter<float> failChance;
     }
     public class BinarySelector : BTNode
     {
+        [Tooltip("Checks the condition every tick, switching child on a change; otherwise only at the start.")]
         public bool dynamic;
         [SerializeField] private ConditionTask _condition;
         public override int maxOutConnections => 2;
@@ -140,31 +156,41 @@ namespace NodeCanvas.BehaviourTrees
 
     [Name("Conditional")] public class ConditionalEvaluator : BTDecorator
     {
+        [Name("Dynamic"), Tooltip("Checks the condition every tick and interrupts the child when it becomes false.")]
         public bool isDynamic;
+        [Tooltip("The status returned when the condition is or becomes false.")]
         public FinalStatus conditionFailReturn = FinalStatus.Failure;
         [SerializeField] private ConditionTask _condition;
     }
     public class WaitUntil : BTDecorator { [SerializeField] private ConditionTask _condition; }
     public class Cooldown : BTDecorator
     {
+        [Tooltip("Seconds the child stays unavailable after it ran.")]
         public BBParameter<float> coolDownTime = 5f;
+        [Tooltip("The status returned while cooling down.")]
         public FinalStatus coolingStatus = FinalStatus.Optional;
     }
     [Name("Repeat")] public class Repeater : BTDecorator
     {
         public enum RepeaterMode { RepeatTimes = 0, RepeatUntil = 1, RepeatForever = 2 }
+        [Tooltip("Repeat a number of times, until the child returns a status, or forever.")]
         public RepeaterMode repeaterMode = RepeaterMode.RepeatTimes;
+        [Tooltip("How many times to run the child in RepeatTimes mode.")]
         public BBParameter<int> repeatTimes = 1;
+        [Tooltip("The child status that ends the repetition in RepeatUntil mode.")]
         public BooleanStatus repeatUntilStatus = BooleanStatus.Success;
     }
     [Name("Iterate")] public class Iterator : BTDecorator
     {
         public enum TerminationConditions { None, FirstSuccess, FirstFailure }
-        [RequiredField, BlackboardOnly] public BBParameter<IList> targetList;
-        [BlackboardOnly] public BBObjectParameter current;
-        [BlackboardOnly] public BBParameter<int> storeIndex;
+        [Tooltip("The list to go through."), RequiredField, BlackboardOnly] public BBParameter<IList> targetList;
+        [Tooltip("Variable that receives the current element."), BlackboardOnly] public BBObjectParameter current;
+        [Tooltip("Variable that receives the current index."), BlackboardOnly] public BBParameter<int> storeIndex;
+        [Tooltip("The child result that ends the iteration early.")]
         public TerminationConditions terminationCondition = TerminationConditions.None;
+        [Tooltip("Upper limit of iterations; -1 goes through the whole list.")]
         public BBParameter<int> maxIteration = -1;
+        [Tooltip("Whether the next run starts from the first element again.")]
         public bool resetIndex = true;
     }
     [Name("Invert")] public class Inverter : BTDecorator { }

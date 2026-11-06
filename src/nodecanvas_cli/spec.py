@@ -6,10 +6,10 @@ import re
 from typing import Any, Dict, List, Optional
 
 from .csharp import ClassDecl
-from .model import Graph
+from .model import NESTED_KEYS, Graph
 from .render import UNITY_OBJECT_BASES, _bb_inner
 from .schema import Schema, short_generic, simple_name
-from .typenames import ALIASES, TypeNames
+from .typenames import ALIASES
 
 REFLECTION = {
     "ExecuteFunction_Multiplatform": "call",
@@ -28,7 +28,6 @@ VECTOR_COMPONENTS = {
     "Quaternion": "xyzw",
     "Color": "rgba",
 }
-NESTED_KEYS = ("_subTree", "_nestedBT", "_nestedFSM", "_nestedDLG", "_subGraph")
 
 
 class Speccer:
@@ -194,7 +193,7 @@ class Speccer:
         if not self.schema.member_kinds(type_name, raw_member):
             raise ValueError("member not found in sources; keep the serialized form")
         member = raw_member[4:] if raw_member.startswith("get_") else raw_member
-        out: Dict[str, Any] = {kind: f"{simple_name(type_name)}.{member}"}
+        out: Dict[str, Any] = {kind: f"{self.schema.display(type_name)}.{member}"}
         params = task.get("parameters") or []
         info_types = (task["method"].get("_paramsInfo") or "").split("|")
         if params:
@@ -240,7 +239,7 @@ class Speccer:
         type_name, fname = task["field"]["_baseInfo"].split("|")
         key = {"set": "setValue", "get": "saveAs", "check": "checkValue"}[kind]
         p = task.get(key) or {}
-        types = TypeNames(self.ws)
+        types = self.ws.types
         decl = self.schema.find(type_name)
         if decl is not None:
             fdecl = None
@@ -252,7 +251,7 @@ class Speccer:
                     break
             if fdecl is None:
                 raise ValueError("field not found in sources; keep the serialized form")
-            out: Dict[str, Any] = {kind: f"{simple_name(type_name)}.{fname}"}
+            out: Dict[str, Any] = {kind: f"{self.schema.display(type_name)}.{fname}"}
             expected = types.full(fdecl.type, decl)
         elif self.schema.resolves(type_name) and isinstance(p.get("_type"), str):
             # a System/Unity type: only the boxed value tells the field's type
@@ -289,11 +288,11 @@ class Speccer:
         ptype = next((c.properties[prop] for c in chain if prop in c.properties), None)
         if ptype is None or not any(prop in c.setters for c in chain):
             raise ValueError("no settable property in sources; keep the serialized form")
-        expected = TypeNames(self.ws).full(ptype, decl)
+        expected = self.ws.types.full(ptype, decl)
         p = task.get("parameter") or {}
         if method.get("_paramsInfo") != expected or p.get("_type") != expected:
             raise ValueError("the value is boxed with another type than the property's")
-        out: Dict[str, Any] = {"set": f"{simple_name(type_name)}.{prop}"}
+        out: Dict[str, Any] = {"set": f"{self.schema.display(type_name)}.{prop}"}
         self._agent(task, out)
         out["value"] = self.param(p, expected, None)
         return self._flags(task, out, {"method", "parameter"})
@@ -336,8 +335,10 @@ class Speccer:
 
     def _type_name(self, full: str) -> str:
         name = short_generic(full)
+        if "<" in name:
+            return self.schema.display(full)
         cands = [c for c in self.schema._load_simple(simple_name(full)) if c.kind == "class"]
-        return name if len(cands) <= 1 or "<" in name else name if self._unique_in_kind(full, cands) else full
+        return name if len(cands) <= 1 or self._unique_in_kind(full, cands) else full
 
     def _unique_in_kind(self, full: str, cands: List[ClassDecl]) -> bool:
         from .build import KIND_NAMESPACES

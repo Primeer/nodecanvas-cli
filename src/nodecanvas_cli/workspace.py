@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -11,6 +12,8 @@ from .model import Graph, GraphError
 from .project import Project, find_project_root
 from .render import Renderer
 from .schema import Schema
+from .typedwalk import prune_refs
+from .typenames import TypeNames
 
 SUPPORTED_MAJOR = 3
 
@@ -23,6 +26,13 @@ class Workspace:
         self._files: Dict[str, UnityFile] = {}
         self._graphs: Dict[str, Graph] = {}
         self._slots: Optional[List[Slot]] = None
+        self._types: Optional[TypeNames] = None
+
+    @property
+    def types(self) -> TypeNames:
+        if self._types is None:
+            self._types = TypeNames(self)
+        return self._types
 
     def close(self) -> None:
         self.schema.close()
@@ -106,6 +116,28 @@ class Workspace:
     def graph(self, query: str, kind: Optional[str] = None) -> Graph:
         return self.load(self.find(query, kind))
 
+    def changed_slots(self) -> List[Slot]:
+        """Graph slots in files changed since HEAD or untracked (git), in ``slots`` order without repeats."""
+        try:
+            diff = subprocess.run(
+                ["git", "diff", "--name-only", "--relative", "HEAD"],
+                cwd=self.project.root,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.split("\n")
+            new = subprocess.run(
+                ["git", "ls-files", "--others", "--exclude-standard"],
+                cwd=self.project.root,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.split("\n")
+        except (OSError, subprocess.CalledProcessError) as e:
+            raise GraphError(f"--changed needs git: {e}") from e
+        paths = {p.strip() for p in diff + new if p.strip()}
+        return [s for s in self.slots if s.path in paths]
+
     def all_graphs(self) -> List[Graph]:
         out = []
         for s in self.slots:
@@ -156,6 +188,7 @@ class Workspace:
     # ------------------------------------------------------------------ saving
 
     def save(self, graph: Graph) -> None:
+        prune_refs(self, graph)
         slot = graph.loaded.slot
         path = slot.path
         f = self.file(path)

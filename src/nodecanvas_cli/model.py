@@ -10,6 +10,8 @@ BT = "NodeCanvas.BehaviourTrees.BehaviourTree"
 FSM = "NodeCanvas.StateMachines.FSM"
 DT = "NodeCanvas.DialogueTrees.DialogueTree"
 KINDS = {BT: "bt", FSM: "fsm", DT: "dt"}
+# Node fields that hold a nested graph (a BBParameter with an object reference).
+NESTED_KEYS = ("_subTree", "_nestedBT", "_nestedFSM", "_nestedDLG", "_subGraph", "_subFSM", "_subDialogue")
 
 
 class GraphError(Exception):

@@ -18,6 +18,8 @@ namespace NodeCanvas.Framework
     public class BBParameter { }
     public class BBParameter<T> : BBParameter { }
     public class BBObjectParameter : BBParameter { }
+    public abstract class Variable { }
+    public class Variable<T> : Variable { }
     public class BBMappingParameter : BBObjectParameter
     {
         [SerializeField] private string _targetSubGraphVariableID;

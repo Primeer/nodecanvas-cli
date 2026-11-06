@@ -62,6 +62,64 @@ def test_rename_member_overloads(ncg, project):
     assert not any(i["code"] == "missing-member" for i in json.loads(out))
 
 
+def test_rename_member_batch(ncg, project):
+    graphs = project / "Assets/Graphs"
+    before = {f: (graphs / f).read_text() for f in ("Bot_BT.asset", "Sub_BT.asset")}
+    code, out, _ = run(ncg, "rename-member", "Bot.Attack=Strike", "Bot.speed=moveSpeed", "Bot.IsDead=Dead", "--dry-run")
+    assert code == 0, out
+    assert "Bot.Attack → Strike: 1 change(s) in 1 graph(s) (Bot.Strike is not in the C# sources yet)" in out
+    assert "Bot.speed → moveSpeed: 1 change(s) in 1 graph(s)" in out
+    assert "== Assets/Graphs/Bot_BT.asset: 2 change(s)" in out and "+├─# ? @Self.Dead" in out
+    assert "dry run: 3 change(s) in 2 graph(s), nothing written" in out
+    assert {f: (graphs / f).read_text() for f in before} == before
+    pairs = "# Bot members\nBot.Attack=Strike\n\nBot.speed moveSpeed  # field\nBot.Nope=X\n"
+    (project / "renames.txt").write_text(pairs)
+    code, out, _ = run(ncg, "rename-member", "Bot.IsDead=Dead", "--file", "renames.txt")
+    assert code == 0, out
+    assert "Bot.Nope → X: nothing to change" in out and "saved 2 graph(s), 3 change(s)" in out
+    tree = ncg("show", "Bot_BT")[1]
+    assert "@Self.Strike($Target)" in tree and "? @Self.Dead" in tree
+    assert "Bot.moveSpeed = 4.0" in ncg("show", "Sub_BT")[1]
+
+
+def test_rename_member_batch_is_atomic(ncg, project):
+    ops = [
+        {
+            "op": "add",
+            "parent": "2",
+            "node": {
+                "$type": "ActionNode",
+                "_action": {"call": "Bot.MoveTo", "args": ["$Target", [0.0, 0.0, 1.0]], "agent": "$Self"},
+            },
+        }
+    ]
+    (project / "ops.json").write_text(json.dumps(ops))
+    assert ncg("apply", "Bot_BT", project / "ops.json")[0] == 0
+    asset = project / "Assets/Graphs/Bot_BT.asset"
+    before = asset.read_text()
+    code, _, err = run(ncg, "rename-member", "Bot.Attack=Strike", "Bot.MoveTo=Go")
+    assert code == 1 and "error: Bot.MoveTo=Go: graphs call 2 overloads of Bot.MoveTo" in err
+    assert "in a batch: Bot.MoveTo(P1,P2)=Go" in err
+    assert asset.read_text() == before
+    code, out, _ = run(ncg, "rename-member", "Bot.Attack=Strike", "Bot.MoveTo(Unit, Vector3)=Go", "--dry-run")
+    assert code == 0, out
+    assert "Bot.MoveTo(Unit, Vector3) → Go: 1 change(s)" in out
+    assert "+│ └─# @Self.Go($Target, (0, 0, 1.0))" in out and "Go((1.0, 0, -2.5))" not in out
+
+
+def test_rename_member_batch_rejects(ncg, project):
+    for args, msg in (
+        (["Bot.Attack=Strike", "Bot.Strike=Hit"], "Bot.Strike is renamed and is also a new name"),
+        (["Bot.Attack=Strike", "Bot.Heal=Attack"], "Bot.Attack is renamed and is also a new name"),
+        (["Bot.Attack=Strike", "Demo.Game.Bot.Attack=Hit"], "Demo.Game.Bot.Attack is renamed twice"),
+        (["Bot.Attack=Strike", "Bot.speed=moveSpeed", "--params", "Unit"], "--params works with one rename"),
+        (["Attack=Strike"], "use Type.Old=New"),
+        ([], "nothing to rename"),
+    ):
+        code, _, err = run(ncg, "rename-member", *args)
+        assert code == 1 and msg in err, (args, err)
+
+
 def test_rename_property_accessor(ncg, project):
     assert run(ncg, "rename-member", "Demo.Game.Bot.IsDead", "Dead")[0] == 0
     assert "? @Self.Dead" in ncg("show", "Bot_BT")[1]

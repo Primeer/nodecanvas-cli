@@ -204,7 +204,12 @@ def cmd_scaffold(ws, a) -> int:
         indent = ws.config.scaffold.indent
     agent_ns = None
     if a.agent:
-        decl = ws.schema.find_simple(a.agent.split(".")[-1])
+        cands = ws.schema.lookup(a.agent, 0)
+        if len(cands) > 1:
+            raise ScaffoldError(
+                f"agent type {a.agent!r} is ambiguous, use the full name: " + ", ".join(c.full_name for c in cands)
+            )
+        decl = cands[0] if cands else None
         if decl is None and "." not in a.agent:
             print(
                 f"note: agent type {a.agent} not found in project sources; add its namespace by hand", file=sys.stderr

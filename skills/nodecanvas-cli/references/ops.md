@@ -102,16 +102,21 @@ syntax as the `map` operation; `nodecanvas-cli node` prints them that way.
 
 | Op | Fields | Notes |
 |---|---|---|
-| `var-add` | `name`, `type`, `value`?, `public`? | `type` is C# (`float`, `bool`, `Vector3`, `Pawn`, `List<Pawn>`). |
-| `var-set` | `name`, `value`?, `public`? | Changes the stored value / exposure. |
+| `var-add` | `name`, `type`, `value`?, `public`?, `after`?/`before`?/`index`? | `type` is C# (`float`, `bool`, `Vector3`, `Pawn`, `List<Pawn>`). Without a position the variable goes last. `after`/`before` name a variable or a section (`"after": "Parameters"`); `index` counts sections too. |
+| `var-set` | `name`, `value`?, `public`?, `type`? | Changes the stored value / exposure / type. `type` keeps the id, so references stay; the old value is converted between primitive types, kept between object types, otherwise dropped (a note says so). Bindings the new type breaks are refused by lint. |
+| `var-move` | `name`, `after`/`before`/`index` | Moves a variable, for example from `Local variables` into `Parameters`. |
 | `var-rename` | `name`, `to` | Updates every reference in this graph. Subgraph mappings in *other* graphs keep working (they use ids). |
 | `var-remove` | `name`, `force`? | Refuses while the variable is used, unless `force`. |
+
+Type names here and in `$type`, `call` and the like must identify one type. A short name shared by several types
+(two `Pawn`s; a project `Transform` and Unity's) is an error listing them: give a full or partial name
+(`Arena.Pawn`). A type outside the project's sources needs its full name (`TMPro.TMP_Text`).
 
 ## Subgraphs
 
 | Op | Fields | Notes |
 |---|---|---|
-| `subgraph-set` | `node`, `graph`, `map`? | Points a SubTree / nested state at another graph asset. |
+| `subgraph-set` | `node`, `graph`, `map`? | Points a SubTree / nested state at another graph asset. Without `map`, existing mappings move to the new graph's variables of the same name and type; the rest are removed, with a note. |
 | `map` | `node`, `map` | Replaces the variable mapping: `{"SubVar": "<-$Parent"}` passes a value in, `"->$Parent"` reads it back after the subgraph runs, `"<->$Parent"` both; a literal passes a constant in. |
 | `map` | `node`, `"auto": true` | Adds mappings for the subgraph's public variables that are not mapped yet, to parent variables with the same name and type; direction from how the subgraph uses each (read → `<-`, written → `->`, both → `<->`). Prints what was mapped and skipped. |
 

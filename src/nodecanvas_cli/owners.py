@@ -19,10 +19,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from . import fsjson
+from .assetrefs import refs_to
 from .container import ObjectRef, _documents, _value_of
-from .model import Graph, walk
+from .model import NESTED_KEYS, Graph, walk
 from .project import Cache
-from .schema import generic_args, short_generic
+from .schema import bare_name, generic_args, short_generic
 from .yamlscalar import find_scalar
 
 MARKERS = (
@@ -546,14 +547,16 @@ def exposed_issues(ws, g: Graph) -> List[Tuple[str, str, str, str]]:
                 )
                 continue
             vt = generic_args(v.get("$type", ""))
-            if ex.value_type and vt and _bare(ex.value_type) != _bare(vt[0]):
+            if ex.value_type and vt and bare_name(ex.value_type) != bare_name(vt[0]):
+                shown, actual = _shown(ex.value_type, ws.schema), var_type(v, ws.schema)
+                if shown == actual:
+                    shown, actual = bare_name(ex.value_type), bare_name(vt[0])
                 out.append(
                     (
                         at,
                         "warning",
                         "exposed-override-type",
-                        f"${v.get('_name')} is overridden as {_shown(ex.value_type)}, "
-                        f"the variable is {var_type(v, ws.schema)}",
+                        f"${v.get('_name')} is overridden as {shown}, the variable is {actual}",
                     )
                 )
     return out
@@ -563,17 +566,10 @@ def overridden_ids(ws, g: Graph) -> set:
     return {ex.var_id for o in index(ws).owners_of(g) for ex in o.exposed}
 
 
-def _shown(t: Optional[str]) -> str:
+def _shown(t: Optional[str], schema) -> str:
     from .views import _alias_generic
 
-    return _alias_generic(short_generic(t)) if t else "?"
-
-
-def _bare(t: str) -> str:
-    """Type name without assembly qualifiers (also inside generic arguments)."""
-    args = generic_args(t)
-    base = t.split("[")[0].split(",")[0].strip() if not args else t[: t.find("[")]
-    return base + ("[" + ",".join(_bare(a) for a in args) + "]" if args else "")
+    return _alias_generic(schema.display(t)) if t else "?"
 
 
 # ---------------------------------------------------------------------------- rendering
@@ -647,14 +643,12 @@ def describe_owner(ws, idx: Index, o: Owner, g: Optional[Graph]) -> List[str]:
     for ex in o.exposed:
         v = g.var_by_id(ex.var_id) if g is not None else None
         name = "$" + v.get("_name") if v is not None else f"${ex.var_id[:8]}!"
-        lines.append(f"  {name} = {exposed_value(ws, idx, o, ex)}  ({_shown(ex.value_type)})")
+        lines.append(f"  {name} = {exposed_value(ws, idx, o, ex)}  ({_shown(ex.value_type, ws.schema)})")
     return lines
 
 
 def subgraph_parents(ws) -> Dict[str, List[str]]:
     """``asset path -> ["Parent #node", ...]`` for graphs used as subgraphs / nested graphs."""
-    from .lint import NESTED_KEYS
-
     out: Dict[str, List[str]] = {}
     for pg in ws.all_graphs():
         for n in pg.nodes:
@@ -676,6 +670,7 @@ def cmd_owners(ws, a) -> int:
     owners = idx.owners_of(g)
     parents = subgraph_parents(ws).get(g.loaded.slot.path, []) if not g.loaded.slot.bound else []
     insts = idx.instances_of(g) if not g.loaded.slot.bound else []
+    assets = refs_to(ws, g.loaded.slot.path) if not g.loaded.slot.bound else []
     if a.json:
         print(
             json.dumps(
@@ -684,6 +679,7 @@ def cmd_owners(ws, a) -> int:
                     "owners": [_owner_json(ws, idx, o, g) for o in owners],
                     "prefab_instances": [{"file": i.path, "source": _graph_label(ws, i.source)} for i in insts],
                     "subgraph_of": parents,
+                    "referenced_by": [{"file": r.path, "object": r.obj, "field": r.field} for r in assets],
                 },
                 ensure_ascii=False,
                 indent=1,
@@ -701,8 +697,10 @@ def cmd_owners(ws, a) -> int:
         )
     if parents:
         print("  subgraph of: " + ", ".join(parents))
-    if not owners and not insts and not parents:
-        print("  not assigned to any owner or parent graph in the project's assets (may be assigned from code)")
+    for r in assets:
+        print(f"  referenced by: {r.label}")
+    if not owners and not insts and not parents and not assets:
+        print("  not assigned to any owner or parent graph, and no asset references it (may be assigned from code)")
     return 0
 
 
@@ -723,7 +721,7 @@ def _owner_json(ws, idx, o: Owner, g: Optional[Graph]) -> dict:
             {
                 "variable": v.get("_name") if v is not None else None,
                 "id": ex.var_id,
-                "type": _shown(ex.value_type),
+                "type": _shown(ex.value_type, ws.schema),
                 "value": exposed_value(ws, idx, o, ex),
             }
         )
@@ -739,7 +737,8 @@ def _owners_all(ws, idx: Index, a) -> int:
         owners = idx.owners_of(g)
         subs = parents.get(g.loaded.slot.path, []) if not g.loaded.slot.bound else []
         insts = idx.instances_of(g) if not g.loaded.slot.bound else []
-        rows.append((g, owners, subs, insts))
+        assets = refs_to(ws, g.loaded.slot.path) if not g.loaded.slot.bound else []
+        rows.append((g, owners, subs, insts, assets))
     orphan_owners = [o for o in idx.owners if o.graph is None and not o.bound]
     if a.json:
         print(
@@ -752,9 +751,10 @@ def _owners_all(ws, idx: Index, a) -> int:
                             "owners": [f"{o.address} ({o.cls})" for o in owners],
                             "prefab_instances": [i.path for i in insts],
                             "subgraph_of": subs,
-                            "unassigned": not (owners or subs or insts),
+                            "referenced_by": [{"file": r.path, "object": r.obj, "field": r.field} for r in assets],
+                            "unassigned": not (owners or subs or insts or assets),
                         }
-                        for g, owners, subs, insts in rows
+                        for g, owners, subs, insts, assets in rows
                     ],
                     "owners_without_graph": [f"{o.address} ({o.cls})" for o in orphan_owners],
                 },
@@ -764,12 +764,14 @@ def _owners_all(ws, idx: Index, a) -> int:
         )
         return 0
     width = max([len(g.name) for g, *_ in rows] + [10])
-    for g, owners, subs, insts in rows:
+    for g, owners, subs, insts, assets in rows:
         parts = [f"{o.address} ({o.cls})" for o in owners if not o.bound]
         parts += [f"bound to {o.go or o.address} ({o.cls})" for o in owners if o.bound]
         parts += [f"{i.path} (PrefabInstance override)" for i in insts]
         if subs:
             parts.append("subgraph of " + ", ".join(subs))
+        if assets:
+            parts.append("referenced by " + ", ".join(r.label for r in assets))
         print(
             f"{g.name:<{width}}  " + ("; ".join(parts) if parts else "— not assigned in assets (may be set from code)")
         )

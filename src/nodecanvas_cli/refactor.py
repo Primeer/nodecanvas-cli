@@ -6,6 +6,7 @@ import copy
 import difflib
 import re
 import sys
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from . import fsjson
@@ -113,6 +114,9 @@ def rename_member(
         fulls = {tname}
     if not fulls:
         return {}
+    live = sorted(t for t in fulls if ws is not None and ws.schema.find(t) is not None)
+    if len(live) > 1:
+        raise RefactorError(f"type {tname!r} is ambiguous, use the full name: " + ", ".join(live))
     called = sorted({sig for t, _, sig in refs if t in fulls and sig is not None})
     label = f"{simple_name(tname)}.{old}"
     rename = set(called)
@@ -171,6 +175,60 @@ def rename_member(
         if n:
             counts[g.loaded.slot.address] = n
     return counts
+
+
+_PAIR = re.compile(r"^(?P<target>[\w.+`]+?)(?:\((?P<params>[^)]*)\))?=(?P<new>\w+)$")
+
+
+def _params_list(text: str) -> List[str]:
+    return [t.strip() for t in text.split(",") if t.strip()]
+
+
+def parse_renames(
+    renames: List[str], file: Optional[str], params: Optional[str]
+) -> List[Tuple[str, str, Optional[List[str]]]]:
+    """``(Type.Old, New, params or None)`` for each rename: ``Type.Old New`` (the single form), or any number of
+    ``Type.Old[(P1,P2)]=New`` arguments and lines of ``file`` (``-`` for stdin; ``Type.Old New`` lines too)."""
+    items: List[str] = []
+    if len(renames) == 2 and not any("=" in r for r in renames):
+        items.append("=".join(renames))
+    else:
+        items += renames
+    if file is not None:
+        text = sys.stdin.read() if file == "-" else Path(file).read_text(encoding="utf-8")
+        for line in text.splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                items.append(line if "=" in line else "=".join(line.split(None, 1)))
+    if not items:
+        raise RefactorError("nothing to rename: give Type.Old New, Type.Old=New pairs or --file")
+    out: List[Tuple[str, str, Optional[List[str]]]] = []
+    for item in items:
+        m = _PAIR.match(item.replace(" ", ""))
+        if m is None or "." not in m["target"].strip("."):
+            raise RefactorError(f"{item!r}: use Type.Old=New or Type.Old(P1,P2)=New")
+        out.append((m["target"], m["new"], _params_list(m["params"]) if m["params"] is not None else None))
+    if params is not None:
+        if len(out) > 1:
+            raise RefactorError("--params works with one rename; pick overloads per pair with Type.Old(P1,P2)=New")
+        if out[0][2] is not None:
+            raise RefactorError(f"{items[0]!r}: overload given twice (in the pair and with --params)")
+        out[0] = (out[0][0], out[0][1], _params_list(params))
+    seen, olds = set(), set()
+    for target, _, ps in out:
+        tname, old = target.rsplit(".", 1)
+        key = (simple_name(tname), old, tuple(simple_name(p) for p in ps) if ps is not None else None)
+        if key in seen:
+            raise RefactorError(f"{target} is renamed twice")
+        seen.add(key)
+        olds.add((simple_name(tname), old))
+    for target, new, _ in out:
+        tname = target.rsplit(".", 1)[0]
+        if (simple_name(tname), new) in olds:
+            raise RefactorError(
+                f"{simple_name(tname)}.{new} is renamed and is also a new name (chains and swaps need two runs)"
+            )
+    return out
 
 
 # ---------------------------------------------------------------------- rename-type
@@ -287,22 +345,38 @@ def cmd_refactor(ws, a) -> int:
         for g in graphs
     }
     snapshots = {g.loaded.slot.address: (copy.deepcopy(g.data), list(g.refs)) for g in graphs}
+    new_names: set = set()
     try:
         if a.action == "rename-member":
-            notes: List[str] = []
-            counts = rename_member(
-                ws,
-                graphs,
-                a.target,
-                a.new,
-                [t.strip() for t in a.params.split(",") if t.strip()] if a.params is not None else None,
-                a.all_overloads,
-                notes,
-            )
-            for line in notes:
-                print("note: " + line)
-            if not ws.schema.member_kinds(a.target.rsplit(".", 1)[0], a.new):
-                print(f"note: {a.target.rsplit('.', 1)[0]}.{a.new} does not exist in the C# sources yet")
+            renames = parse_renames(a.renames, a.file, a.params)
+            new_names = {new for _, new, _ in renames}
+            counts = {}
+            summary: List[str] = []
+            for target, new, params in renames:
+                tname = target.rsplit(".", 1)[0]
+                label = target + (_sig(tuple(params)) if params is not None else "")
+                notes: List[str] = []
+                try:
+                    pair = rename_member(ws, graphs, target, new, params, a.all_overloads, notes)
+                except RefactorError as e:
+                    if len(renames) == 1:
+                        raise
+                    hint = f" (in a batch: {target}(P1,P2)={new})" if "--params" in str(e) else ""
+                    raise RefactorError(f"{label}={new}: {e}{hint}") from e
+                for line in notes:
+                    print("note: " + line)
+                missing = not ws.schema.member_kinds(tname, new)
+                if missing and len(renames) == 1:
+                    print(f"note: {tname}.{new} does not exist in the C# sources yet")
+                for addr, n in pair.items():
+                    counts[addr] = counts.get(addr, 0) + n
+                summary.append(
+                    f"{label} → {new}: "
+                    + (f"{sum(pair.values())} change(s) in {len(pair)} graph(s)" if pair else "nothing to change")
+                    + (f" ({simple_name(tname)}.{new} is not in the C# sources yet)" if missing else "")
+                )
+            if len(renames) > 1:
+                print("\n".join(summary))
         elif a.action == "rename-type":
             counts = rename_type(ws, graphs, a.old, a.new, a.assembly)
         else:
@@ -351,7 +425,7 @@ def cmd_refactor(ws, a) -> int:
                 expected = (
                     a.action == "rename-member"
                     and i.code == "missing-member"
-                    and any(f".{p}{a.new} " in i.message for p in ("", "get_", "set_"))
+                    and any(f".{p}{n} " in i.message for p in ("", "get_", "set_") for n in new_names)
                 )
                 new_errors += i.severity == ERROR and not expected
     total = sum(counts.values())
@@ -372,8 +446,12 @@ def register(sub) -> None:
     rs = s.add_subparsers(dest="action", required=True)
 
     r = rs.add_parser("rename-member", help="rename a method/property/field used by reflection tasks in every graph")
-    r.add_argument("target", help="Type.OldMember")
-    r.add_argument("new", help="NewMember")
+    r.add_argument(
+        "renames",
+        nargs="*",
+        help="Type.OldMember NewMember, or several Type.Old=New (Type.Old(P1,P2)=New picks an overload)",
+    )
+    r.add_argument("--file", help="file of renames, one Type.Old=New (or Type.Old New) per line; - for stdin")
     r.add_argument("--params", help="only calls bound to this overload, e.g. Vector3 or Unit,Vector3 ('' for none)")
     r.add_argument("--all-overloads", action="store_true", help="rename calls of every overload")
     r.add_argument("--graph", help="limit to one graph")

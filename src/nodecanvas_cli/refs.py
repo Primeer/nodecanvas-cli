@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Dict, List
 
+from .assetrefs import refs_to
 from .model import Graph, walk
 from .schema import short_generic, simple_name
 
@@ -74,18 +75,26 @@ def find_refs(ws, query: str, kind: str = "auto"):
                                 yield g, label, f"subgraph {ws.ref_display(r)}"
 
 
+def _asset_hits(ws, query: str) -> list:
+    """References to the graph named ``query`` from fields of other assets."""
+    low = query.strip().lower().replace(".asset", "")
+    return [r for s in ws.slots if not s.bound and s.name.lower() == low for r in refs_to(ws, s.path)]
+
+
 def cmd_refs(ws, a) -> int:
     hits = list(find_refs(ws, a.query, a.kind))
+    assets = _asset_hits(ws, a.query) if a.kind in ("auto", "graph") else []
     if a.json:
         print(
             json.dumps(
-                [{"graph": g.loaded.slot.address, "at": label, "what": what} for g, label, what in hits],
+                [{"graph": g.loaded.slot.address, "at": label, "what": what} for g, label, what in hits]
+                + [{"asset": r.path, "at": r.obj, "what": f"field {r.field}"} for r in assets],
                 ensure_ascii=False,
                 indent=1,
             )
         )
         return 0
-    if not hits:
+    if not hits and not assets:
         print(f"no references to {a.query!r}")
         return 0
     cur = None
@@ -97,6 +106,8 @@ def cmd_refs(ws, a) -> int:
         owner = g.node(label[1:]) if label.startswith("#") and "->" not in label else None
         detail = r.node_label(owner) if owner is not None else ""
         print(f"  {label:<10} {what:<28} {detail}")
+    for r in assets:
+        print(f"referenced by: {r.label}")
     return 0
 
 

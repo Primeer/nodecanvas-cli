@@ -6,7 +6,8 @@ import copy
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .model import Graph
-from .schema import generic_args, short_generic, simple_name
+from .schema import generic_args, simple_name
+from .typerel import REASONS, UNITY_VALUE_TYPES, is_assignable, relation, severity
 
 PRIMITIVES = {
     "System.Boolean",
@@ -45,44 +46,7 @@ def is_reference_type(schema, type_name: str) -> bool:
     return decl is not None and decl.kind in ("class", "interface", "record")
 
 
-UNITY_VALUE_TYPES = {
-    "Vector2",
-    "Vector3",
-    "Vector4",
-    "Quaternion",
-    "Color",
-    "Color32",
-    "Rect",
-    "Bounds",
-    "LayerMask",
-    "Vector2Int",
-    "Vector3Int",
-    "Ray",
-    "RaycastHit",
-}
-
-
-def _known(schema, t: str) -> bool:
-    """Types whose assignability can be decided offline (sources, primitives, Unity value types)."""
-    t = _strip(t)
-    if t.startswith("UnityEngine."):
-        return t.split(".")[-1] in UNITY_VALUE_TYPES
-    return t in PRIMITIVES or schema.find(t) is not None
-
-
-def assignable(schema, var_t: Optional[str], target: str) -> bool:
-    """Can a variable of ``var_t`` be passed where ``target`` is expected (same type or a source subclass)?"""
-    if not var_t:
-        return False
-    if _strip(var_t) == _strip(target):
-        return True
-    decl = schema.find(_strip(var_t))
-    if decl is None:
-        return False
-    want = simple_name(target)
-    return any(
-        c.name == want or any(b.split("<")[0].split(".")[-1] == want for b in c.bases) for c in schema.chain(decl)
-    )
+assignable = is_assignable
 
 
 def _path_str(path: Tuple) -> str:
@@ -118,8 +82,8 @@ def check_task(ws, g: Graph, owner: dict, path: Tuple, task: dict) -> Iterable[T
     if mismatch:
         k = mismatch[0]
         msg = (
-            f"argument {k + 1} of {label} is stored as {short_generic(params[k]['_type'])} "
-            f"but the bound overload takes {short_generic(sig[k])}"
+            f"argument {k + 1} of {label} is stored as {schema.display_pair(params[k]['_type'], sig[k])[0]} "
+            f"but the bound overload takes {schema.display_pair(params[k]['_type'], sig[k])[1]}"
         )
         fix = None
         better = _fitting_overload(ws, g, type_name, member, params, sig)
@@ -135,19 +99,23 @@ def check_task(ws, g: Graph, owner: dict, path: Tuple, task: dict) -> Iterable[T
         var = g.var_by_id(p["_targetVariableID"])
         vt = var_type(var) if var is not None else None
         pt = _strip(sig[k])
-        if not vt or _strip(vt) == pt or not _known(schema, vt) or not _known(schema, pt):
+        if not vt:
             continue
-        if not assignable(schema, vt, pt):
-            msg = (
-                f"argument {k + 1} of {label} is ${var.get('_name')} ({short_generic(vt)}) "
-                f"but the parameter takes {short_generic(pt)}"
-            )
-            better = _fitting_overload(ws, g, type_name, member, params, sig)
-            fix = None
-            if better is not None:
-                msg += f"; overload {member}({', '.join(simple_name(x) for x in better)}) fits the arguments"
-                fix = _retarget_fix(ws, g, owner, path, task, better)
-            yield "warning", "arg-type-mismatch", msg, fix
+        rel = relation(schema, vt, pt)
+        level = severity(rel, vt, pt)
+        if level is None:
+            continue
+        shown_v, shown_p = schema.display_pair(vt, pt)
+        msg = (
+            f"argument {k + 1} of {label} is ${var.get('_name')} ({shown_v}) "
+            f"but the parameter takes {shown_p}: {REASONS[rel]}"
+        )
+        better = _fitting_overload(ws, g, type_name, member, params, sig)
+        fix = None
+        if better is not None:
+            msg += f"; overload {member}({', '.join(simple_name(x) for x in better)}) fits the arguments"
+            fix = _retarget_fix(ws, g, owner, path, task, better)
+        yield level, "arg-type-mismatch", msg, fix
 
     # empty object arguments
     for k, p in enumerate(params):
@@ -171,11 +139,11 @@ def check_task(ws, g: Graph, owner: dict, path: Tuple, task: dict) -> Iterable[T
             yield (
                 "info",
                 "null-arg",
-                f"{where} ({short_generic(t)}) is empty (null is passed); if unintended, did you mean {names}?",
+                f"{where} ({schema.display(t)}) is empty (null is passed); if unintended, did you mean {names}?",
                 fix,
             )
         else:
-            yield ("info", "null-arg", f"{where} ({short_generic(t)}) is empty (null is passed)", None)
+            yield ("info", "null-arg", f"{where} ({schema.display(t)}) is empty (null is passed)", None)
 
     agent = task.get("overrideAgent")
     if (
@@ -303,11 +271,7 @@ def _fitting_overload(
 
 
 def ws_full(ws, type_text: str, ctx) -> str:
-    from .typenames import TypeNames
-
-    if not hasattr(ws, "_typenames"):
-        ws._typenames = TypeNames(ws)
-    return ws._typenames.full(type_text, ctx)
+    return ws.types.full(type_text, ctx)
 
 
 def _retarget_fix(ws, g: Graph, owner: dict, path: Tuple, task: dict, overload: List[str]) -> Optional[dict]:

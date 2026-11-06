@@ -67,6 +67,10 @@ def test_mcp_tools_in_memory(project):
             out = _text(await c.call_tool("new_graph", {**args, "dry_run": False}))
             head = _text(await c.call_tool("show", {"graph": "M_BT"})).splitlines()[1] + "  "
             assert "Cool time:float  " in head and "Target:Unit(pub)" in head, out
+            renames = ["Bot.Attack=Strike", "Bot.speed=moveSpeed"]
+            out = _text(await c.call_tool("refactor_rename_member", {"renames": renames}))
+            assert "Bot.speed → moveSpeed: 1 change(s)" in out
+            assert "dry run: 3 change(s) in 3 graph(s)" in out  # M_BT is a copy of Bot_BT
 
     asyncio.run(go())
 

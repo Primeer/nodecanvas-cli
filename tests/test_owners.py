@@ -114,3 +114,139 @@ def test_apply_uses_external_variables(ncg, project):
     )
     code, _, err = ncg("apply", "Patrol_BT", project / "bad.json")
     assert code == 1 and "owners' blackboards" in err
+
+
+BOT_DATA = """%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_GameObject: {{fileID: 0}}
+  m_Script: {{fileID: 11500000, guid: {script}, type: 3}}
+  m_Name: Kai_BotData
+  m_EditorClassIdentifier: Game::Demo.BotData
+  nameKey: bot7_name
+  behaviour:
+    primary:
+      fsm: {{fileID: 11400000, guid: {guid}, type: 2}}
+  extras:
+  - id: 1
+    tree: {{fileID: 11400000, guid: {guid}, type: 2}}
+  - {{fileID: 11400000, guid: {guid}, type: 2}}
+  addressable:
+    m_AssetGUID: {guid}
+"""
+
+
+def _graph_guid(project, name):
+    meta = (project / f"Assets/Graphs/{name}.asset.meta").read_text()
+    return next(line.split()[1] for line in meta.splitlines() if line.startswith("guid:"))
+
+
+def _add_bot_data(project, name="Talk_DT"):
+    (project / "Assets/Game/BotData.cs").write_text(
+        "namespace Demo { public class BotData : UnityEngine.ScriptableObject { } }"
+    )
+    (project / "Assets/Game/BotData.cs.meta").write_text("fileFormatVersion: 2\nguid: " + "c" * 32 + "\n")
+    text = BOT_DATA.format(script="c" * 32, guid=_graph_guid(project, name))
+    (project / "Assets/Game/Kai_BotData.asset").write_text(text)
+    return project / "Assets/Game/Kai_BotData.asset"
+
+
+def test_owners_sees_references_from_scriptable_objects(ncg, project):
+    _add_bot_data(project)
+    code, out, _ = ncg("owners", "Talk_DT")
+    assert code == 0 and "not referenced" not in out
+    assert "referenced by: Assets/Game/Kai_BotData.asset (BotData).behaviour.primary.fsm" in out
+    assert "(BotData).extras.tree" in out and "(BotData).extras\n" in out
+    assert "(BotData).addressable.m_AssetGUID" in out
+    data = json.loads(ncg("owners", "Talk_DT", "--json")[1])
+    assert {"file": "Assets/Game/Kai_BotData.asset", "object": "(BotData)", "field": "behaviour.primary.fsm"} in data[
+        "referenced_by"
+    ]
+
+
+def test_owners_all_counts_asset_references_as_a_use(ncg, project):
+    _add_bot_data(project)
+    data = json.loads(ncg("owners", "--all", "--json")[1])
+    assert {g["graph"] for g in data["graphs"] if g["unassigned"]} == {"Assets/Graphs/Broken_BT.asset"}
+    out = ncg("owners", "--all")[1]
+    line = next(x for x in out.splitlines() if x.startswith("Talk_DT"))
+    assert "referenced by Assets/Game/Kai_BotData.asset" in line
+
+
+def test_refs_lists_asset_references(ncg, project):
+    _add_bot_data(project)
+    out = ncg("refs", "Talk_DT")[1]
+    assert "referenced by: Assets/Game/Kai_BotData.asset (BotData).behaviour.primary.fsm" in out
+    hits = json.loads(ncg("refs", "Talk_DT", "--json")[1])
+    assert any(h.get("asset") == "Assets/Game/Kai_BotData.asset" for h in hits)
+    assert "referenced by" not in ncg("refs", "Talk_DT", "--kind", "member")[1]
+
+
+def test_asset_references_follow_file_changes(ncg, project):
+    path = _add_bot_data(project)
+    assert "referenced by:" in ncg("owners", "Talk_DT")[1]
+    path.write_text(path.read_text().replace(_graph_guid(project, "Talk_DT"), "d" * 32) + "# edited\n")
+    assert "referenced by:" not in ncg("owners", "Talk_DT")[1]
+
+
+def test_prefab_fields_and_overrides_are_named(ncg, project):
+    guid = _graph_guid(project, "Talk_DT")
+    (project / "Assets/Prefabs/Holder.prefab").write_text(
+        f"""%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100
+GameObject:
+  m_Name: Holder
+--- !u!114 &200
+MonoBehaviour:
+  m_GameObject: {{fileID: 100}}
+  m_EditorClassIdentifier: Game::Demo.Brain
+  dialogue: {{fileID: 11400000, guid: {guid}, type: 2}}
+--- !u!1001 &300
+PrefabInstance:
+  m_Modification:
+    m_Modifications:
+    - target: {{fileID: 1}}
+      propertyPath: speech
+      objectReference: {{fileID: 11400000, guid: {guid}, type: 2}}
+"""
+    )
+    out = ncg("owners", "Talk_DT")[1]
+    assert "Assets/Prefabs/Holder.prefab Holder (Brain).dialogue" in out
+    assert "Assets/Prefabs/Holder.prefab PrefabInstance.speech" in out
+
+
+def test_a_stale_entry_in_another_graph_is_not_a_use(ncg, project):
+    path = project / "Assets/Graphs/Bot_BT.asset"
+    lines = path.read_text().split("\n")
+    i = next(k for k, line in enumerate(lines) if line.startswith("  _objectReferences:"))
+    lines.insert(i + 1, "  - {fileID: 11400000, guid: " + _graph_guid(project, "Talk_DT") + ", type: 2}")
+    path.write_text("\n".join(lines))
+    assert "referenced by:" not in ncg("owners", "Talk_DT")[1]
+
+
+def test_a_field_called_graph_on_another_class_is_still_a_reference(ncg, project):
+    path = _add_bot_data(project)
+    path.write_text(path.read_text().replace("    primary:\n      fsm:", "    primary:\n      _graph:"))
+    assert "(BotData).behaviour.primary._graph" in ncg("owners", "Talk_DT")[1]
+
+
+def test_owner_fields_are_not_repeated_as_references(ncg):
+    out = ncg("owners", "Patrol_BT")[1]
+    assert "Assets/Prefabs/Guard.prefab:Guard  GuardOwner" in out and "referenced by:" not in out
+
+
+def test_a_new_graph_is_found_in_files_scanned_before(ncg, project):
+    path = _add_bot_data(project)
+    assert "referenced by:" in ncg("owners", "Talk_DT")[1]
+    assert ncg("new", "Assets/Graphs/Fresh.asset", "--kind", "bt")[0] == 0
+    fresh = _graph_guid(project, "Fresh")
+    # a file written before the graph existed, with the same size and time as when it was scanned
+    import os
+
+    st = path.stat()
+    path.write_text(path.read_text().replace(_graph_guid(project, "Talk_DT"), fresh))
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+    assert "referenced by:" in ncg("owners", "Fresh")[1]

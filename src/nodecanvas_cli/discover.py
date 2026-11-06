@@ -48,6 +48,7 @@ def cmd_types(ws, a) -> int:
                         "type": d.full_name,
                         "name": d.attr_str("Name"),
                         "description": d.attr_str("Description"),
+                        **({"fields": _field_rows(ws, d)} if a.fields or exact or len(rows) == 1 else {}),
                     }
                     for r, c, d in rows
                 ],
@@ -57,13 +58,13 @@ def cmd_types(ws, a) -> int:
         )
         return 0
     if not rows and a.query:
-        decl = ws.schema.find(a.query) or ws.schema.find_simple(a.query.split(".")[-1])
-        if decl is not None:
+        for decl in ws.schema.lookup(a.query):
             bases = f" : {', '.join(decl.bases)}" if decl.bases else ""
             print(
                 f"{decl.full_name}: {decl.kind}{bases} in {decl.file} — not a task or node type "
-                f"(use `nodecanvas-cli members {decl.name}` for its members)"
+                f"(use `nodecanvas-cli members {decl.full_name.split('`')[0]}` for its members)"
             )
+        if ws.schema.lookup(a.query):
             return 0
     if len(rows) == 1 or a.fields:
         for r, c, d in rows:
@@ -81,38 +82,67 @@ def _print_type(ws, d, role) -> None:
     print(f"{d.full_name}  role={role}" + (f'  name="{d.attr_str("Name")}"' if d.attr_str("Name") else ""))
     if d.attr_str("Description"):
         print("  " + d.attr_str("Description").replace("\n", " ")[:300])
-    fields = ws.schema.ordered_fields(d.full_name)
-    skip = {
-        "_UID",
-        "_name",
-        "_tag",
-        "_position",
-        "_comment",
-        "_isBreakpoint",
-        "_collapsed",
-        "_color",
-        "_verboseLevel",
-        "_isDisabled",
-        "overrideAgent",
-        "_infoCollapsed",
-    }
-    for name, f, owner in fields:
-        if name in skip:
-            continue
-        extra = ""
-        enum = ws.schema.enum_for(re.sub(r"^BBParameter<(.+)>$", r"\1", f.type), owner)
-        if enum is not None:
-            extra = "  {" + ", ".join(enum.enum_values().values()) + "}"
-        init = f" = {f.init}" if f.init else ""
-        print(f"  {name}: {f.type}{init}{extra}")
+    for row in _field_rows(ws, d):
+        extra = "  {" + ", ".join(row["enum"]) + "}" if row.get("enum") else ""
+        init = f" = {row['default']}" if row.get("default") else ""
+        label = f'  "{row["label"]}"' if row.get("label") else ""
+        flags = "".join(f"  [{flag}]" for flag in row.get("flags", []))
+        doc = "  — " + row["doc"] if row.get("doc") else ""
+        print(f"  {row['name']}: {row['type']}{init}{extra}{label}{flags}{doc}")
     print()
 
 
+_HIDDEN_FIELDS = {
+    "_UID",
+    "_name",
+    "_tag",
+    "_position",
+    "_comment",
+    "_isBreakpoint",
+    "_collapsed",
+    "_color",
+    "_verboseLevel",
+    "_isDisabled",
+    "overrideAgent",
+    "_infoCollapsed",
+}
+_FIELD_FLAGS = {"RequiredField": "required", "BlackboardOnly": "blackboard only"}
+
+
+def _field_rows(ws, d) -> list:
+    """The fields a person sets on this type: what they are, what they mean (``[Tooltip]``, ``[Name]``)."""
+    rows = []
+    for name, f, owner in ws.schema.ordered_fields(d.full_name):
+        if name in _HIDDEN_FIELDS:
+            continue
+        row = {"name": name, "type": f.type}
+        enum = ws.schema.enum_for(re.sub(r"^BBParameter<(.+)>$", r"\1", f.type), owner)
+        if enum is not None:
+            row["enum"] = list(enum.enum_values().values())
+        if f.init:
+            row["default"] = f.init
+        if f.display_name:
+            row["label"] = f.display_name
+        flags = [text for attr, text in _FIELD_FLAGS.items() if attr in f.attrs]
+        if flags:
+            row["flags"] = flags
+        if f.doc:
+            row["doc"] = " ".join(f.doc.split())
+        rows.append(row)
+    return rows
+
+
 def cmd_members(ws, a) -> int:
-    decl = ws.schema.find(a.type) or ws.schema.find_simple(a.type)
-    if decl is None:
+    cands = ws.schema.lookup(a.type)
+    if len(cands) > 1:
+        cands = [c for c in cands if c.arity == 0] or cands
+    if len(cands) > 1:
+        print(f"error: type {a.type!r} is ambiguous, use the full name: " + ", ".join(c.full_name for c in cands))
+        return 1
+    if not cands:
         print(f"error: type {a.type!r} not found in project sources")
         return 1
+    decl = cands[0]
     q = (a.query or "").lower()
     print(f"{decl.full_name}" + (f" : {', '.join(decl.bases)}" if decl.bases else ""))
     seen = set()

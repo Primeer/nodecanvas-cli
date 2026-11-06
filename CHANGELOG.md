@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.3.0 — 2026-11-06
+
+- `refactor rename-member`: several renames in one run — `Type.Old=New` pairs (`Type.Old(P1,P2)=New` picks an
+  overload) and/or `--file` with one pair per line. One combined diff and lint pass, a per-pair summary,
+  one save; if any pair fails nothing is written. Chains and swaps are rejected. The MCP
+  `refactor_rename_member` tool takes `renames`.
+- `lint --changed`: lint only graphs in files changed since `HEAD` (plus untracked), like
+  `verify --unity --changed`; the MCP `lint` tool takes `changed`. `lint` and `verify` reject `--changed`
+  together with graph names.
+- `lint`: a type saved under a namespace that no longer exists, but found by its short name, is now a
+  `stale-type-name` warning (with "ambiguous" when several types share the name) instead of a
+  `missing-type` / `missing-var-type` error. NodeCanvas resolves such names by short name on load, so
+  `verify --unity` and `lint` used to disagree. `show`/`vars` render these wrappers as `(recovered)`.
+- `lint`: the summary line counts issues hidden by `--min` (`40 info hidden, --min info to show`).
+- `verify --unity`: notes how many Missing wrappers in the file NodeCanvas restored on load.
+- Type names typed by a person (`new --var`, `var-add`, `SetVariable<T>`, `call Type.Member`, `scaffold --agent`,
+  `members`) never resolve by guess. A short name shared by several types is an error listing them, partial
+  qualifiers work (`Arena.Pawn`), a wrong qualifier is no longer ignored, and an unknown short name is an error with
+  suggestions instead of an invented `Name, Assembly-CSharp`. `refactor rename-member Pawn.X=Y` refuses when
+  graphs call two types of that name, where it used to rename both. **Possibly breaking:** types outside the project's
+  sources now need their full name (`UnityEngine.AI.NavMeshAgent`).
+- New type model, following `ParadoxNotion.TypeConverter` and comparing full names. `lint`: new
+  `param-type-mismatch` (task and node parameters against bound variables, with generic types substituted);
+  `mapping-type-mismatch` checks each direction and can now be an error; `arg-type-mismatch` too. Two unrelated
+  components with the same short name or types with no conversion are errors, so `apply`, `copy` and `new` refuse
+  to introduce them without `--force`.
+- `verify --unity` includes static lint errors and type-contract warnings: Unity reports neither, because such
+  types "convert" to null through `GetComponent`.
+- `verify --unity` waits for an Editor that is compiling or reloading scripts instead of failing with "no Editor
+  reachable" right after `unity recompile`, repeats the check if a reload interrupts it, and reports Safe Mode with
+  its compile errors and an open modal dialog as such.
+- Messages, `vars`, `show` and `apply` diffs print full names for types whose short name is not unique.
+- `_objectReferences`: entries nothing uses are removed on every save, so `subgraph-set` no longer leaves the old
+  GUID behind. New `stale-object-ref` lint warning for files that already have such entries. Entries are never
+  touched while a field of unknown type might be using them.
+- `subgraph-set` moves mappings to the new graph's variables of the same name and type and removes the rest,
+  instead of leaving stale ones.
+- Fixed: `extract`, `inline`, `copy --create-vars` and `new --from` copied object values of variables with indices
+  that meant another object, or nothing, in the destination graph.
+- `owners` / `refs`: references to a graph from any field of any asset (`referenced by:
+  Kai_BotData.asset (BotData).fsm`); such graphs are no longer reported as unassigned. Also finds Addressables
+  references and object overrides in `m_Modifications`.
+- `types` explains fields: `[Tooltip]`, `[Name]`, required / blackboard-only marks, also in `--json` (`fields`).
+  The built-in declarations carry short explanations of the main nodes, and `types` lists them in projects
+  without NodeCanvas sources.
+- `apply`: `var-add` takes `after`, `before` or `index`; new `var-move`; `var-set` takes `type`.
+
 ## 0.2.0 — 2026-10-16
 
 - Claude Code plugin: `bin/nodecanvas-cli` puts the command on the agent's PATH (Claude Code 2.1.91+),

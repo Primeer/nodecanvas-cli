@@ -10,7 +10,7 @@ from typing import List, Optional
 
 from . import __version__
 from .container import ContainerError
-from .model import GraphError
+from .model import NESTED_KEYS, GraphError
 from .project import ProjectError
 from .views import render_graph
 from .workspace import Workspace
@@ -27,7 +27,7 @@ def cmd_list(ws: Workspace, a) -> int:
             continue
         subs = []
         for n in g.nodes:
-            for k in ("_subTree", "_nestedBT", "_nestedFSM", "_nestedDLG", "_subGraph"):
+            for k in NESTED_KEYS:
                 v = n.get(k)
                 if isinstance(v, dict) and "_value" in v:
                     r = g.ref(v["_value"])
@@ -69,7 +69,7 @@ def cmd_show(ws: Workspace, a) -> int:
         seen = {g.loaded.slot.address}
 
         def expand(node, level=[0]):
-            for k in ("_subTree", "_nestedBT", "_nestedFSM", "_nestedDLG", "_subGraph"):
+            for k in NESTED_KEYS:
                 v = node.get(k)
                 if isinstance(v, dict) and "_value" in v:
                     ref = g.ref(v["_value"])

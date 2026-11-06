@@ -20,7 +20,8 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 from .container import Slot
-from .model import Graph
+from .lint import static_issues
+from .model import Graph, walk
 
 SNIPPET = Path(__file__).with_name("unity_verify.cs.txt")
 BUSY = "return EditorApplication.isCompiling || EditorApplication.isUpdating;"
@@ -35,8 +36,18 @@ STATUS_TEXT = {
 }
 
 
+# Exit codes of the Unity CLI worth waiting out: no Editor answered, the request ran out of time, it is busy
+# (loading, compiling, reloading scripts).
+TRANSIENT = {12, 14, 17}
+AWAITING_INPUT = 18
+
+
 class UnityUnavailable(Exception):
     """The Editor cannot be reached (exit code 2)."""
+
+    def __init__(self, message: str, code: Optional[int] = None):
+        super().__init__(message)
+        self.code = code
 
 
 class UnityFailed(Exception):
@@ -128,8 +139,52 @@ class Editor:
             if diags:
                 raise UnityFailed("the verification snippet does not compile in this project: " + "; ".join(diags[:5]))
             msg = _messages(doc) or (p.stderr.strip().splitlines() or [f"exit code {p.returncode}"])[-1]
-            raise UnityUnavailable(msg)
+            if p.returncode == AWAITING_INPUT:
+                raise UnityFailed(f"a dialog in the Editor waits for an answer (`unity command editor dialog`): {msg}")
+            raise UnityUnavailable(msg, p.returncode)
         return doc
+
+    def _status(self, *args: str, timeout: float = 30) -> dict:
+        """``unity status`` for this project; it reads the Editor's state without connecting to it."""
+        argv = [self.exe, "status", "--project-path", str(self.project), *args, "--json", "--no-banner"]
+        argv.append("--non-interactive")
+        try:
+            p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout + 30)
+            return json.loads(p.stdout) if p.stdout.strip() else {}
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return {}
+
+    def _editor_open(self, status: dict) -> bool:
+        """The project has an Editor: listed by ``unity status`` or holding Unity's lock on the project."""
+        count = _find(status, lambda k, v: k == "count" and isinstance(v, int))
+        return bool(count) or (self.project / "Temp" / "UnityLockfile").exists()
+
+    def connect(self, limit: float, log=None) -> None:
+        """First contact. An Editor that is compiling or reloading scripts (right after `unity recompile`, say)
+        drops its Pipeline connection for a while, which is not the same as no Editor at all: wait for that one."""
+        deadline = time.monotonic() + limit
+        noted = False
+        while True:
+            try:
+                self.refresh()
+                return
+            except UnityUnavailable as e:
+                status = self._status()
+                errors = _find(status, lambda k, v: k == "compileErrors" and isinstance(v, list) and v)
+                if errors:
+                    texts = [x.get("message", str(x)) if isinstance(x, dict) else str(x) for x in errors[:5]]
+                    raise UnityFailed("the Editor is in Safe Mode, scripts do not compile: " + "; ".join(texts)) from e
+                listed = bool(_find(status, lambda k, v: k == "count" and isinstance(v, int)))
+                if not self._editor_open(status) or time.monotonic() > deadline:
+                    raise
+                if noted and listed and e.code not in TRANSIENT:
+                    raise  # it is there and ready, and this is not about being busy
+                if log is not None and not noted:
+                    log("the Editor is not answering yet (compiling or reloading scripts?), waiting…")
+                noted = True
+                left = max(1, int(deadline - time.monotonic()))
+                if self._status("--until-ready", "--timeout", str(left), timeout=left).get("success") is not True:
+                    time.sleep(1.0)
 
     def busy(self) -> bool:
         doc = self.command("eval", BUSY, timeout=60)
@@ -189,23 +244,26 @@ def target_of(slot: Slot) -> Tuple[str, str]:
     return slot.path, (slot.anchor or "") if slot.bound else ""
 
 
-def changed_slots(ws) -> List[Slot]:
-    root = ws.project.root
-    try:
-        diff = subprocess.run(
-            ["git", "diff", "--name-only", "--relative", "HEAD"], cwd=root, capture_output=True, text=True, check=True
-        ).stdout.split("\n")
-        new = subprocess.run(
-            ["git", "ls-files", "--others", "--exclude-standard"], cwd=root, capture_output=True, text=True, check=True
-        ).stdout.split("\n")
-    except (OSError, subprocess.CalledProcessError) as e:
-        raise UnityFailed(f"--changed needs git: {e}") from e
-    paths = {p.strip() for p in diff + new if p.strip()}
-    return [s for s in ws.slots if s.path in paths]
+def _missing_wrappers(g: Graph) -> int:
+    """Missing* wrappers saved in the file (variables, nodes, tasks)."""
+    n = sum(1 for v in g.variables.values() if "MissingVariableType" in v.get("$type", ""))
+    for owner in list(g.nodes) + list(g.connections):
+        n += sum(1 for _, d in walk(owner) if "Framework.Internal.Missing" in (d.get("$type") or ""))
+    return n
 
 
 def _compare(g: Graph, r: dict) -> List[Tuple[str, str, str]]:
     out = []
+    wrappers = _missing_wrappers(g)
+    if wrappers and not any("missing" in (i.get("text") or "") for i in r.get("issues", [])):
+        out.append(
+            (
+                "info",
+                "-",
+                f"{wrappers} Missing wrapper(s) in the file were restored on load "
+                "(`nodecanvas-cli lint --min info` lists them; --resave drops them)",
+            )
+        )
     if r.get("nodes") is not None and r["nodes"] != len(g.nodes):
         out.append(("error", "-", f"Unity loaded {r['nodes']} nodes, the file has {len(g.nodes)}"))
     if r.get("variables") is not None and r["variables"] != len(g.variables):
@@ -233,6 +291,18 @@ def _console(entries: List[dict], verbose: bool) -> List[Tuple[str, str]]:
     return out
 
 
+def _run_snippet(editor: Editor, path: str, timeout: float, deadline: float, log) -> dict:
+    """``eval_file``, again after a wait if a script reload took the Editor away in the meantime."""
+    while True:
+        try:
+            return editor.command("eval_file", path, str(int(timeout * 1000)))
+        except UnityUnavailable as e:
+            left = deadline - time.monotonic()
+            if e.code not in TRANSIENT or left <= 0:
+                raise
+            editor.wait_ready(left, log)
+
+
 def cmd_verify(ws, a) -> int:
     if not a.unity:
         print(
@@ -240,8 +310,11 @@ def cmd_verify(ws, a) -> int:
             file=sys.stderr,
         )
         return 2
+    if a.changed and a.graphs:
+        print("error: name graphs or pass --changed, not both", file=sys.stderr)
+        return 2
     if a.changed:
-        slots = changed_slots(ws)
+        slots = ws.changed_slots()
         if not slots:
             print("no changed graphs (git diff HEAD + untracked files)")
             return 0
@@ -262,23 +335,27 @@ def cmd_verify(ws, a) -> int:
         print("error: the Unity CLI (`unity`) is not on PATH; install it or set NODECANVAS_CLI_UNITY", file=sys.stderr)
         return 2
     editor = Editor(exe, ws.project.root, a.timeout)
+    log = lambda m: print(m, file=sys.stderr)  # noqa: E731
     try:
-        editor.refresh()
-    except (UnityUnavailable, UnityFailed) as e:
+        editor.connect(a.timeout, log)
+    except UnityFailed as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    except UnityUnavailable as e:
         print(
             f"error: no Unity Editor with the Pipeline package is reachable for {ws.project.root}: {e}\n"
             "  open the project in Unity (add the package once with `unity pipeline install`) and try again",
             file=sys.stderr,
         )
         return 2
-    log = lambda m: print(m, file=sys.stderr)  # noqa: E731
+    deadline = time.monotonic() + a.timeout
     try:
         editor.wait_ready(a.timeout, log)
         fd, tmp = tempfile.mkstemp(prefix="nodecanvas_cli_verify_", suffix=".cs")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(build_snippet([target_of(s) for s in slots], a.resave))
-            doc = editor.command("eval_file", tmp, str(int(a.timeout * 1000)))
+            doc = _run_snippet(editor, tmp, a.timeout, deadline, log)
         finally:
             os.unlink(tmp)
         report = parse_report(doc)
@@ -308,6 +385,9 @@ def cmd_verify(ws, a) -> int:
         ]
         if g is not None and r.get("status") == "ok":
             issues += _compare(g, r)
+        if g is not None:
+            # what Unity cannot see: types that convert (through GetComponent, say) and still deliver nothing
+            issues += [(i.severity, i.at, f"[{i.code}] {i.message}") for i in static_issues(ws, g)]
         console = _console(r.get("console", []), a.verbose)
         status = r.get("status", "?")
         bad = (

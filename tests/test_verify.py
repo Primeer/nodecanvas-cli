@@ -10,6 +10,27 @@ argv = sys.argv[1:]
 with open(os.environ["FAKE_UNITY_LOG"], "a") as fh:
     fh.write(json.dumps(argv) + "\n")
 mode = os.environ.get("FAKE_UNITY_MODE", "ok")
+if argv[0] == "status":
+    if os.environ.get("FAKE_UNITY_SAFE_MODE"):
+        print(json.dumps({{"success": True, "data": {{"count": 1, "instances": [{{"state": "safe-mode",
+              "safeMode": {{"compileErrors": [{{"message": "Bot.cs(3,1): error CS1002"}}]}}}}]}}}}))
+    elif mode == "down":
+        print(json.dumps({{"success": False, "data": {{"count": 0}}}}))
+    else:
+        print(json.dumps({{"success": True, "data": {{"count": 1, "instances": [{{"state": "ready"}}]}}}}))
+    sys.exit(0)
+outage = int(os.environ.get("FAKE_UNITY_OUTAGE", "0"))
+if outage or os.environ.get("FAKE_UNITY_SNIPPET_OUTAGE"):
+    # the first calls find the Editor reloading scripts: no Pipeline connection, exit code 12
+    counter = os.environ["FAKE_UNITY_LOG"] + ".count"
+    n = int(open(counter).read()) if os.path.exists(counter) else 0
+    open(counter, "w").write(str(n + 1))
+    limit = outage or int(os.environ["FAKE_UNITY_SNIPPET_OUTAGE"])
+    hit = n < limit if outage else (argv[1] == "eval_file" and n < limit + 2)
+    if hit:
+        print(json.dumps({{"success": False,
+                          "errors": [{{"code": "EDITOR_UNREACHABLE", "message": "No Pipeline instance found"}}]}}))
+        sys.exit(12)
 if mode == "down":
     print(json.dumps({{"success": False,
                       "errors": [{{"code": "COMMAND_FAILED", "message": "No Pipeline instance found"}}]}}))
@@ -129,3 +150,90 @@ def test_verify_changed(ncg, fake_unity, project):
     assert ncg("apply", "Sentry", project / "ops.json")[0] == 0
     code, out, _ = ncg("verify", "--unity", "--changed")
     assert "Sentry.prefab:Sentry" in out and "Bot_BT" not in out
+
+
+def test_verify_notes_missing_wrappers_restored_on_load(ncg, fake_unity):
+    # Broken_BT saves #6 as MissingAction; Unity reported no missing type, so it restored the wrapper
+    _, out, _ = ncg("verify", "--unity", "Broken_BT")
+    assert "1 Missing wrapper(s) in the file were restored on load" in out
+    _, out, _ = ncg("verify", "--unity", "Bot_BT")
+    assert "Missing wrapper" not in out
+
+
+def test_verify_changed_with_names_is_an_error(ncg, fake_unity):
+    code, _, err = ncg("verify", "--unity", "--changed", "Bot_BT")
+    assert code == 2 and "not both" in err
+
+
+def test_verify_waits_for_an_editor_reloading_scripts(ncg, fake_unity, project, monkeypatch):
+    # right after `unity recompile` the Editor has no Pipeline connection for a while, but it is there
+    (project / "Temp").mkdir()
+    (project / "Temp/UnityLockfile").write_text("")
+    monkeypatch.setenv("FAKE_UNITY_OUTAGE", "2")
+    code, out, err = ncg("verify", "--unity", "Bot_BT")
+    assert code == 0, err
+    assert "waiting" in err and "ok   Assets/Graphs/Bot_BT.asset" in out
+    names = [c[0] if c[0] == "status" else c[1] for c in fake_unity()]
+    assert names.count("status") >= 2 and names[-1] == "eval_file"
+
+
+def test_verify_does_not_wait_when_no_editor_is_open(ncg, fake_unity, monkeypatch):
+    monkeypatch.setenv("FAKE_UNITY_MODE", "down")
+    code, _, err = ncg("verify", "--unity", "Bot_BT")
+    assert code == 2 and "waiting" not in err and "No Pipeline instance found" in err
+    assert "--until-ready" not in [x for c in fake_unity() for x in c]
+
+
+def test_verify_gives_up_on_the_timeout(ncg, fake_unity, project, monkeypatch):
+    (project / "Temp").mkdir()
+    (project / "Temp/UnityLockfile").write_text("")
+    monkeypatch.setenv("FAKE_UNITY_OUTAGE", "1000")
+    code, _, err = ncg("verify", "--unity", "Bot_BT", "--timeout", "1")
+    assert code == 2 and "No Pipeline instance found" in err
+
+
+def test_verify_reports_safe_mode(ncg, fake_unity, monkeypatch):
+    monkeypatch.setenv("FAKE_UNITY_OUTAGE", "1000")
+    monkeypatch.setenv("FAKE_UNITY_SAFE_MODE", "1")
+    code, _, err = ncg("verify", "--unity", "Bot_BT")
+    assert code == 2 and "Safe Mode" in err and "error CS1002" in err
+
+
+def test_verify_retries_the_check_after_a_reload(ncg, fake_unity, monkeypatch):
+    monkeypatch.setenv("FAKE_UNITY_SNIPPET_OUTAGE", "1")
+    code, out, err = ncg("verify", "--unity", "Bot_BT")
+    assert code == 0, err
+    assert [c[1] for c in fake_unity()].count("eval_file") == 2
+
+
+def test_verify_fails_on_a_type_contract_unity_cannot_see(ncg, fake_unity, project):
+    (project / "Assets/Game/Pawns.cs").write_text(
+        "using UnityEngine; namespace A { public class Pawn : MonoBehaviour { } } "
+        "namespace B { public class Pawn : MonoBehaviour { } }"
+    )
+    sub = [{"op": "var-add", "name": "T", "type": "A.Pawn", "public": True}]
+    (project / "ops.json").write_text(json.dumps(sub))
+    assert ncg("apply", "Sub_BT", project / "ops.json")[0] == 0
+    ops = [{"op": "var-add", "name": "P", "type": "B.Pawn"}, {"op": "map", "node": "8", "map": {"T": "<-$P"}}]
+    (project / "ops.json").write_text(json.dumps(ops))
+    assert ncg("apply", "Bot_BT", project / "ops.json", "--force")[0] == 0
+    code, out, _ = ncg("verify", "--unity", "Bot_BT")
+    assert code == 1 and "FAIL Assets/Graphs/Bot_BT.asset" in out
+    assert "[mapping-type-mismatch] Sub_BT.$T (A.Pawn) is mapped to $P (B.Pawn)" in out
+    rows = json.loads(ncg("verify", "--unity", "Bot_BT", "--json")[1])["graphs"]
+    assert rows[0]["ok"] is False
+
+
+def test_verify_shows_contract_warnings_under_ok(ncg, fake_unity, project):
+    (project / "Assets/Game/Comp.cs").write_text(
+        "using UnityEngine; namespace A { public class Health : MonoBehaviour { } }"
+    )
+    sub = [{"op": "var-add", "name": "T", "type": "A.Health", "public": True}]
+    (project / "ops.json").write_text(json.dumps(sub))
+    assert ncg("apply", "Sub_BT", project / "ops.json")[0] == 0
+    # $Target is a Unit component; no new variable, the fake Editor reports the fixture's variable count
+    (project / "ops.json").write_text(json.dumps([{"op": "map", "node": "8", "map": {"T": "<-$Target"}}]))
+    assert ncg("apply", "Bot_BT", project / "ops.json")[0] == 0
+    code, out, _ = ncg("verify", "--unity", "Bot_BT")
+    assert code == 0 and "ok   Assets/Graphs/Bot_BT.asset" in out
+    assert "warning" in out and "[mapping-type-mismatch]" in out

@@ -21,10 +21,11 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from .csharp import ClassDecl, FieldDecl
-from .model import Graph
+from .model import NESTED_KEYS, Graph
 from .render import UNITY_OBJECT_BASES, _bb_inner
 from .schema import generic_args, simple_name
-from .typenames import ALIASES, TypeNames
+from .typenames import ALIASES, TypeNameError
+from .typerel import Rel, is_assignable, relation
 
 COMPARE_NAMES = {"==": "EqualTo", ">": "GreaterThan", "<": "LessThan", ">=": "GreaterOrEqualTo", "<=": "LessOrEqualTo"}
 KIND_NAMESPACES = {
@@ -61,17 +62,25 @@ class Builder:
         self.ws = ws
         self.g = graph
         self.schema = ws.schema
-        self.types = TypeNames(ws)
+        self.types = ws.types
 
     # ------------------------------------------------------------------ types
 
+    def user_type(self, text: str) -> str:
+        """CLR full name of a type named in a spec; a name that fits several types or none is an error."""
+        try:
+            return self.types.user(text)
+        except TypeNameError as e:
+            raise BuildError(str(e)) from e
+
     def resolve_type(self, name: str, roles: Optional[set] = None) -> str:
         name = name.strip()
-        m = re.match(r"^([\w.]+)<(.+)>$", name)
+        m = re.match(r"^([\w.+]+)<(.+)>$", name)
         if m:
             base, args = m.group(1), _split_generic(m.group(2))
-            decl = self._pick(base.split(".")[-1], roles, len(args))
-            return decl.full_name + "[" + ",".join(f"[{self.types.qualify(a, decl)}]" for a in args) + "]"
+            decl = self._pick(base, roles, len(args))
+            qualified = [self.types.assembly_qualified(self.user_type(a)) for a in args]
+            return decl.full_name + "[" + ",".join(f"[{q}]" for q in qualified) + "]"
         if "`" in name or (("." in name) and self.schema.find(name) is not None):
             decl = self.schema.find(name)
             if decl is None:
@@ -80,11 +89,7 @@ class Builder:
         return self._pick(name, roles, None).full_name
 
     def _pick(self, simple: str, roles: Optional[set], arity: Optional[int]) -> ClassDecl:
-        cands = [
-            c
-            for c in self.schema._load_simple(simple)
-            if c.kind == "class" and not c.is_abstract and (arity is None or c.arity == arity)
-        ]
+        cands = [c for c in self.schema.lookup(simple, arity) if c.kind == "class" and not c.is_abstract]
         if not cands:
             cands = self._by_display_name(simple, roles)
         if roles:
@@ -108,14 +113,7 @@ class Builder:
     def _by_display_name(self, name: str, roles) -> List[ClassDecl]:
         out = []
         roles = roles or TASK_ROLES | NODE_ROLES.get(self.g.kind, set())
-        pool = list(self.schema.all_of_role(roles))
-        known = {d.full_name for d in pool}
-        pool += [
-            d
-            for d in self.schema._builtin_full.values()
-            if d.full_name not in known and not d.is_abstract and self.schema.role(d.full_name) in roles
-        ]
-        for d in pool:
+        for d in self.schema.all_of_role(roles):
             disp = d.attr_str("Name")
             if disp and disp.replace(" ", "").lower() == name.replace(" ", "").lower():
                 out.append(d)
@@ -147,7 +145,7 @@ class Builder:
         return node
 
     def _nested_graph(self, node: dict):
-        for k in ("_subTree", "_nestedBT", "_nestedFSM", "_nestedDLG", "_subGraph"):
+        for k in NESTED_KEYS:
             v = node.get(k)
             if isinstance(v, dict) and "_value" in v:
                 ref = self.g.ref(v["_value"])
@@ -485,7 +483,14 @@ class Builder:
         if "." not in target:
             raise BuildError(f"{kind}: use Type.Member, got {target!r}")
         tname, member = target.rsplit(".", 1)
-        decl = self.schema.find(tname) or self.schema.find_simple(tname.split(".")[-1])
+        cands = self.schema.lookup(tname)
+        if len(cands) > 1:
+            cands = [c for c in cands if c.arity == 0] or cands
+        if len(cands) > 1:
+            raise BuildError(
+                f"type {tname!r} is ambiguous, use the full name: " + ", ".join(c.full_name for c in cands)
+            )
+        decl = cands[0] if cands else None
         if decl is None:
             if "fieldType" in spec:
                 full = self.types.full(tname)
@@ -625,20 +630,25 @@ class Builder:
         if overload is not None:
             want = [str(x).split(".")[-1] for x in overload]
             cands = [o for o in cands if [p.split(".")[-1] for p in o["params"]] == want]
-        if len(cands) > 1:
-            cands = [o for o in cands if all(self._arg_fits(a, p, decl) for a, p in zip(args, o["params"]))] or cands
+        for exact in (True, False):  # the same type first: a subclass also fits the overload of its base
+            if len(cands) > 1:
+                fit = [o for o in cands if all(self._arg_fits(a, p, decl, exact) for a, p in zip(args, o["params"]))]
+                cands = fit or cands
         if len(cands) != 1:
             sigs = "; ".join(f"{member}({', '.join(o['params'])})" for o in overloads) or "none"
             raise BuildError(f"cannot pick {decl.name}.{member} for {len(args)} arg(s); overloads: {sigs}")
         return cands[0], False
 
-    def _arg_fits(self, arg: Any, ptype: str, ctx) -> bool:
+    def _arg_fits(self, arg: Any, ptype: str, ctx, exact: bool = False) -> bool:
         if isinstance(arg, str) and arg.startswith("$"):
             from .owners import find_external_var
 
             var = self.g.var_by_name(arg[1:]) or find_external_var(self.ws, self.g, arg[1:])
             vt = self._var_value_type(var) if var else None
-            return vt is not None and vt.split(",")[0].split(".")[-1] == self.types.full(ptype, ctx).split(".")[-1]
+            if vt is None:
+                return False
+            want = self.types.full(ptype, ctx)
+            return relation(self.schema, vt, want) is Rel.SAME if exact else is_assignable(self.schema, vt, want)
         if isinstance(arg, bool):
             return ptype == "bool"
         if isinstance(arg, (int, float)):
@@ -652,10 +662,11 @@ class Builder:
     # ------------------------------------------------------------------ blackboard
 
     def new_variable(self, name: str, type_text: str, value: Any = None, public: bool = False) -> dict:
-        qualified = self.types.qualify(type_text)
+        full = self.user_type(type_text)
+        qualified = self.types.assembly_qualified(full)
         var: Dict[str, Any] = {}
         if value is not None:
-            lit = self.literal(value, type_text, None)
+            lit = self.literal(value, full, None)
             if not _is_default(lit):
                 var["_value"] = lit
         var["_name"] = name

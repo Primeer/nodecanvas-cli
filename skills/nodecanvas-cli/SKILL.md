@@ -89,8 +89,10 @@ their defaults are shown with their real meaning (taken from the project's C# so
 - `nodecanvas-cli owners <graph>` — prefabs/scenes whose GraphOwner (BehaviourTreeOwner, FSMOwner, project
   subclasses) runs the graph, with the owner's Blackboard (and its parent AssetBlackboard) and the
   exposed-variable overrides (`$Var = value`); also parent graphs using it as a subgraph, and PrefabInstances
-  overriding `_graph` (listed, not parsed further). `owners --all` — table of every graph; graphs
-  assigned nowhere in assets are flagged (they may still be assigned from code).
+  overriding `_graph` (listed, not parsed further), and any other asset whose field points at the graph
+  (`referenced by: …Kai_BotData.asset (BotData).fsm`: a ScriptableObject, a component in a prefab or scene, an
+  Addressables reference). `owners --all` — table of every graph; graphs nothing in assets refers to are flagged
+  (they may still be loaded from code). `refs <graph>` lists these references too.
 - `nodecanvas-cli blackboards [--global]` — Blackboard / GlobalBlackboard components and AssetBlackboards
   with their variables.
 - `vars` and `show` mark variables that are not on the graph's own blackboard with their source:
@@ -107,6 +109,10 @@ all commands work on every graph at once, print a compact diff per graph and sup
   tell which one moved (calls of the others are kept and noted), or pick it with `--params Pawn,Vector3`
   (`--params ''` for no parameters); `--all-overloads` renames every overload. When graphs call several
   overloads and nothing tells which one is meant, the command stops with an error.
+  Several members at once — one diff, one save, nothing written if any pair fails:
+  `rename-member Bot.Attack=Strike Bot.speed=moveSpeed "Bot.MoveTo(Unit,Vector3)=Go"` (the `(…)` suffix picks
+  the overload for that pair), or `--file renames.txt` with one `Type.Old=New` per line (`-` for stdin).
+  Chains and swaps (`A=B B=A`) need two runs.
 - `nodecanvas-cli refactor rename-type Old.Namespace.Type New.Namespace.Type [--assembly Asm]` — namespace,
   name or nesting changes (also fixes "missing type" wrappers left by an earlier rename).
 - `nodecanvas-cli refactor retarget BotController.DistanceTo --to Booster [--from Pawn]` — move calls to another
@@ -158,13 +164,30 @@ drops the TODO comments (for projects that do not want comments).
 
 ## Checking graphs
 
-`nodecanvas-cli lint [graph...] [--min info]` reports missing task/variable types, variables that are not on
+`nodecanvas-cli lint [graph... | --changed] [--min info]` (`--changed`: only graphs in files changed since
+`HEAD`, plus untracked ones) reports missing task/variable types, variables that are not on
 the blackboard, reflection bindings to members that no longer exist, unassigned or missing subgraphs,
-stale subgraph variable mappings, arguments whose stored or variable type does not fit the bound
-overload (`arg-type-mismatch`, with a `fix:` op when another overload fits), subgraph mappings between
-variables of different types, too many children for a node type, unreachable nodes, and graph assets whose
+stale subgraph variable mappings, type contracts between variables and what they are bound to (below),
+object references nothing uses (`stale-object-ref`), too many children for a node type, unreachable nodes, and graph assets whose
 `m_Name` differs from the file name (`name-mismatch`, warning — e.g. after renaming the file outside Unity). It exits with 1 when there are errors. Run it
 after C# refactors that touch types used by graphs.
+
+Type contracts: `param-type-mismatch` (a task or node parameter, generic ones included: `SetVariable<A.Pawn>` bound
+to a variable of `B.Pawn`), `mapping-type-mismatch` (a subgraph mapping, in each direction it flows) and
+`arg-type-mismatch` (a reflection argument, with a `fix:` op when another overload fits) follow NodeCanvas's own
+conversions, comparing full type names:
+
+| Case | Severity |
+|---|---|
+| Same type, subclass, `object`, number to a wider number, anything to `string` | none |
+| Through the GameObject: `GameObject` ↔ component, a Unity component ↔ a project one, component → `Vector3` | info |
+| Other conversions (`bool` ↔ `float`, `float` → `int`, `Vector3` → `Vector2`) | warning |
+| Two unrelated project components with different short names: `GetComponent` finds something only if the GameObject has both | warning |
+| Two unrelated project components with the same short name (two `Pawn`s): almost certainly the wrong type | error |
+| No conversion at all | error |
+| A type outside the sources | not reported (info for a mapping) |
+
+Unity reports none of these, since such types do convert (to null): the static checks are what catches them.
 
 Owners and blackboards: `missing-global-var` (warning) — `$Name/Var` has no GlobalBlackboard
 `Name` with that variable; `exposed-override-type` / `exposed-override-stale` (warning) — an owner
@@ -185,7 +208,14 @@ editor's minimum node size; `off-grid` (info).
 
 `recoverable-missing` (info) means NodeCanvas once saved a task or variable as "missing" while its type
 did not compile; the type exists again, Unity restores it on load and the wrapper disappears on the
-next save in the editor. `show` renders such tasks with `(recovered)`. It is not an error.
+next save in the editor. `show` renders such tasks with `(recovered)`. It is not an error. Info is
+hidden by default: the summary line says how many (`56 info hidden, --min info to show`).
+
+`stale-type-name` (warning): a saved type name (or a generic argument of it) no longer exists under its
+full name, but a type with the same short name does — usually its namespace changed. NodeCanvas falls
+back to the short name on load, so Unity loads the graph and `verify --unity` reports it as fine;
+`verify --unity --resave` stores the current name. With several types of that name the message says
+"ambiguous": NodeCanvas then takes whichever it meets first.
 
 ## Checking graphs in the Unity Editor
 
@@ -193,7 +223,10 @@ next save in the editor. `show` renders such tasks with `(recovered)`. It is not
 open Unity Editor to re-import each graph, deserialize and validate it, and reports what NodeCanvas sees:
 node/task errors shown red in the graph editor (missing tasks, missing reflected members), Missing
 wrappers left after loading, overloads resolved by name fallback, node/variable counts that differ from
-the file, and console errors logged meanwhile. It waits for script compilation first. Exit code 0 — all
+the file, and console errors logged meanwhile. Every static lint error and type-contract warning for the
+graph is added (`[mapping-type-mismatch] …`), because Unity cannot see those: an error makes the graph `FAIL`, a
+warning prints under `ok`. It waits for script compilation first, and for an Editor that is reloading scripts
+(right after `unity recompile`, say); a project in Safe Mode is reported with its compile errors. Exit code 0 — all
 fine, 1 — problems, 2 — no Editor reachable (it needs the `unity` CLI and the project's
 `com.unity.pipeline` package; `unity pipeline install` adds it). Use it after edits when an Editor is
 open, instead of asking the user to open the graph. Graphs bound in scenes are checked only when the
@@ -205,7 +238,7 @@ wrappers); it changes files, so use it only when asked.
 1. `nodecanvas-cli show <graph>` — note the `#ids` you will touch (ids are positions; they change after every edit).
 2. To learn how to write a node, print a similar existing one with `nodecanvas-cli node <graph> <id>` and
    adapt it. For a task or node type you have not seen yet: `nodecanvas-cli types <Name>` (fields, defaults,
-   enum values) or `nodecanvas-cli types --role action|condition|bt|composite|decorator|fsm|dt`.
+   enum values, and what each field means when the source has a `[Tooltip]`) or `nodecanvas-cli types --role action|condition|bt|composite|decorator|fsm|dt`.
    For reflection tasks: `nodecanvas-cli members <Type> [filter]` lists callable properties/methods.
 3. Write a JSON array of operations and run `nodecanvas-cli apply <graph> ops.json --dry-run` (or `-` for stdin).
    Read the printed before/after diff (blackboard changes follow it as `vars:` lines: `+`/`-` added or removed,
@@ -213,7 +246,8 @@ wrappers); it changes files, so use it only when asked.
    placed, moved by the edit, and which existing subtrees were shifted (and by how much) to make room.
    Add `--positions` to see coordinates in the diff. Then run again without `--dry-run`.
 4. `nodecanvas-cli show <graph>` again to get the new ids before the next batch.
-5. If a Unity Editor is open on the project, `nodecanvas-cli verify --unity --changed` confirms Unity loads the result.
+5. After the last batch, `nodecanvas-cli lint --changed` checks every graph you touched; if a Unity Editor is open
+   on the project, `nodecanvas-cli verify --unity --changed` confirms Unity loads the result.
 
 A batch is atomic: if any operation fails, or the result has new lint errors, nothing is written (use
 `--force` only when the error is expected). Connection limits (e.g. a BinarySelector's two children)

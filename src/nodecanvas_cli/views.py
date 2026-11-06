@@ -6,7 +6,7 @@ from typing import Callable, List, Optional, Set
 
 from .model import Graph
 from .render import Renderer, type_alias
-from .schema import short_generic, simple_name
+from .schema import generic_args, short_generic, simple_name
 
 
 def header(g: Graph, r: Renderer, with_vars: bool = True) -> List[str]:
@@ -38,21 +38,24 @@ def var_type(v: dict, schema=None) -> str:
     t = v.get("$type", "")
     if "MissingVariableType" in t:
         mt = v.get("_missingType", "?")
-        if schema is not None and schema.resolves(mt):
-            s = short_generic(mt)
-            s = s[len("Variable<") : -1] if s.startswith("Variable<") else s
-            return _alias_generic(s) + "(recovered)"
+        if schema is not None and schema.resolves(mt, by_name=True):
+            return _alias_generic(_value_type(mt, schema)) + "(recovered)"
         return "MISSING " + short_generic(mt)
-    s = short_generic(t)
-    s = s[len("Variable<") : -1] if s.startswith("Variable<") else s
-    return _alias_generic(s)
+    return _alias_generic(_value_type(t, schema))
+
+
+def _value_type(t: str, schema) -> str:
+    """The value type of a ``Variable<T>`` (or the type itself) as it should read."""
+    if simple_name(t) == "Variable" and generic_args(t):
+        t = generic_args(t)[0]
+    return schema.display(t) if schema is not None else short_generic(t)
 
 
 def _alias_generic(s: str) -> str:
     import re
 
     return re.sub(
-        r"\b(Boolean|Single|Double|Int32|Int64|String|Byte|Char|UInt32)\b", lambda m: type_alias(m.group(1)), s
+        r"(?<![.\w])(Boolean|Single|Double|Int32|Int64|String|Byte|Char|UInt32)\b", lambda m: type_alias(m.group(1)), s
     )
 
 
