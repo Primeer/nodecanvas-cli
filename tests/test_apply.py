@@ -310,6 +310,11 @@ def positions(ncg, graph):
     return g, {g.nid(n): (n["_position"].get("x", 0.0), n["_position"].get("y", 0.0)) for n in g.nodes}
 
 
+def fixed_layout(project, **gaps):
+    """Nodes count as points: ``sizing: fixed`` is the layout of projects that set it, with exact distances."""
+    (project / "nodecanvas-cli.json").write_text(json.dumps({"layout": {"sizing": "fixed", **gaps}}))
+
+
 def test_arity_is_checked_after_the_whole_batch(ncg, project):
     ops = [
         {
@@ -339,6 +344,7 @@ def test_simplify_removes_redundant_merges(ncg, project):
 
 
 def test_grid_layout(ncg, project):
+    fixed_layout(project)
     _, before = positions(ncg, "Bot_BT")
     ops = [
         {
@@ -378,7 +384,7 @@ def test_grid_layout(ncg, project):
 
 
 def test_layout_config(ncg, project):
-    (project / "nodecanvas-cli.json").write_text('{"layout": {"level_gap": 100, "sibling_gap": 400}}')
+    fixed_layout(project, level_gap=100, sibling_gap=400)
     assert (
         apply(
             ncg,
@@ -411,6 +417,7 @@ def test_diff_against_git(ncg, project):
 
 
 def test_apply_reports_layout_shifts(ncg, project):
+    fixed_layout(project)
     ops = [{"op": "add", "parent": "2", "index": 1, "node": {"$type": "ActionNode", "_action": {"$type": "Wait"}}}]
     code, out, _ = apply(ncg, project, "Bot_BT", ops, "--dry-run")
     assert code == 0
@@ -423,6 +430,7 @@ def test_apply_reports_layout_shifts(ncg, project):
 
 
 def test_layout_op_aligns_subtree_root_to_parent(ncg, project):
+    fixed_layout(project)
     assert apply(ncg, project, "Bot_BT", [{"op": "layout", "node": "6"}])[0] == 0
     g, after = positions(ncg, "Bot_BT")
     assert after["6"][1] == after["2"][1] + 200
@@ -446,6 +454,7 @@ MERGE_OPS = [
 
 
 def test_merge_with_two_parents_gets_a_slot(ncg, project):
+    fixed_layout(project)
     _, before = positions(ncg, "Bot_BT")
     code, _, err = apply(ncg, project, "Bot_BT", MERGE_OPS, "--force")
     assert code == 0, err
@@ -465,6 +474,7 @@ def test_separate_terminates_with_shared_children(ncg, project, monkeypatch):
     # shift #6's branch together with the Merge, which is #6's child too.
     from nodecanvas_cli.layout import Layouter
 
+    fixed_layout(project)
     monkeypatch.setattr(Layouter, "slot_parent", lambda self, n, positioned: self.parent(n))
     code, _, err = apply(ncg, project, "Bot_BT", MERGE_OPS, "--force")
     assert code == 0, err

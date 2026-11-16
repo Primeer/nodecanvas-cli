@@ -276,6 +276,27 @@ REASONS = {
 }
 
 
+STORED_TYPE_REASONS = {
+    ERROR: "NodeCanvas converts the value to the stored type and casting that to the variable's type fails at run time",
+    WARNING: "a type outside the sources, so its effect cannot be checked",
+    INFO: "the value still fits",
+}
+
+
+def stored_type_severity(schema, stored: str, actual: str) -> Optional[str]:
+    """How much it matters that a subgraph mapping stores ``stored`` for a variable of type ``actual``.
+
+    The value is converted to the stored type and then cast with ``(T)value``, which is stricter than ``relation``:
+    a boxed float converts to int, but does not cast to it. So only a type that is assignable as it is goes through.
+    """
+    rel = relation(schema, stored, actual)
+    if rel is Rel.SAME:
+        return None
+    if rel is Rel.ASSIGNABLE:
+        return INFO
+    return WARNING if rel is Rel.UNKNOWN else ERROR
+
+
 def is_assignable(schema, src: Optional[str], dst: str) -> bool:
     """A variable of ``src`` can be passed as ``dst`` as it is: the same type or a subclass."""
     return bool(src) and relation(schema, src, dst) in (Rel.SAME, Rel.ASSIGNABLE)

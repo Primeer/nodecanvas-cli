@@ -313,6 +313,22 @@ def build_server(project: Optional[str] = None):
         the static type-contract problems Unity cannot see. Waits for an Editor that is reloading scripts."""
         return cli("verify", "--unity", *(graphs or []), *_opt("--changed", changed))
 
+    @server.tool(annotations=rw)
+    def layout(
+        graph: str, node: str = "0", unity: bool = False, dry_run: bool = True, kind: Optional[str] = None
+    ) -> str:
+        """Tidy a Behaviour Tree's layout. Node sizes are estimated from their text; unity=true takes exact sizes from
+        the open Unity Editor and fails if it is not reachable. dry_run defaults to true: pass dry_run=false to save."""
+        return cli(
+            "layout",
+            graph,
+            "--node",
+            node,
+            *_opt("--unity", unity),
+            *_opt("--dry-run", dry_run),
+            *_opt("--kind", kind),
+        )
+
     return server
 
 

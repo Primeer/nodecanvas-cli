@@ -58,9 +58,9 @@ vars: Self:Bot(pub)  Target:Unit  Alert:bool  Cool time:float  Speed:float
 - Byte-exact: unchanged graphs round-trip identically; edited graphs are re-serialized with Unity's
   YAML folding and FullSerializer's key order, so diffs stay minimal.
 - **verify --unity** — after editing, let the open Unity Editor import, deserialize and validate the graphs
-  (through the [Unity CLI](https://docs.unity.com/) and the project's `com.unity.pipeline` package) and
-  report NodeCanvas errors, Missing types, broken reflection bindings and console messages.
-- Pure Python ≥ 3.9, no dependencies, no Unity required (except for `verify --unity`); the optional MCP
+  (through the [Unity CLI](https://docs.unity.com/) 1.0+ and the project's `com.unity.pipeline` package; 1.0 is
+  preferred, older packages are still driven through their `eval_file`) and report NodeCanvas errors, Missing types, broken reflection bindings and console messages.
+- Pure Python ≥ 3.9, no dependencies, no Unity required (except for `verify --unity`, `layout --unity` and `calibrate --unity`); the optional MCP
   server needs `nodecanvas-cli[mcp]`.
 
 ## Install
@@ -135,16 +135,24 @@ nodecanvas-cli new <path.asset> --kind bt|fsm|dt [--var "Name:type[=value][:pub]
 nodecanvas-cli extract <graph> <node> <new.asset> | inline <graph> <node> | copy <src> <node> <dst> <parent>
 nodecanvas-cli apply <graph> <ops.json | -> [--dry-run] [--force]
 nodecanvas-cli verify --unity [graph... | --changed] [--resave]   # load the graphs in the open Unity Editor
+nodecanvas-cli layout <graph> [--node N] [--unity] [--dry-run]    # tidy a Behaviour Tree by node size
+nodecanvas-cli calibrate --unity [graph...] [--write]             # compare estimated node sizes with Unity
 ```
 
 `<graph>` is a path, an asset name, a unique prefix, or `Prefab.prefab:GameObject` for bound graphs;
 `--kind bt|fsm|dt` disambiguates names shared by graphs of different kinds.
 
-Layout of created/moved nodes can be tuned with `nodecanvas-cli.json` in the Unity project root:
+The NodeCanvas editor never saves a node's size, so layout estimates it from the node's text and works without Unity;
+`layout --unity` takes exact sizes from the open Editor and fails if there is none. Layout of created/moved nodes can be
+tuned with `nodecanvas-cli.json` in the Unity project root:
 
 ```json
-{"layout": {"grid": 20, "level_gap": 200, "sibling_gap": 300}, "scaffold": {"comments": false}}
+{"layout": {"grid": 20, "level_gap": 100, "sibling_gap": 60}, "scaffold": {"comments": false}}
 ```
+
+Gaps are clear space between node edges. `"sizing": "fixed"` brings back the old behaviour: nodes count as points and the
+gaps (200 and 300 by default) are distances between their top-left corners. `calibrate --unity --write` stores the
+character width of your Editor's font as `layout.char_width`.
 
 ### Editing example
 

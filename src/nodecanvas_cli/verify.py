@@ -1,9 +1,9 @@
 """``nodecanvas-cli verify --unity``: load graphs in the open Unity Editor and report what NodeCanvas sees.
 
-The Editor is driven through the Unity CLI (``unity command eval_file``), which talks to the
-project's Pipeline package (``com.unity.pipeline``). nodecanvas-cli waits for script compilation, then
-re-imports each graph, deserializes and validates it, and collects node/task warnings, Missing
-wrappers that survived loading, and console messages logged meanwhile.
+The Editor is driven through the Unity CLI (``unity command script eval --file``; ``eval_file`` on a Pipeline
+package older than 1.0), which talks to the project's Pipeline package (``com.unity.pipeline``). nodecanvas-cli
+waits for script compilation, then re-imports each graph, deserializes and validates it, and collects node/task
+warnings, Missing wrappers that survived loading, and console messages logged meanwhile.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 from .container import Slot
-from .lint import static_issues
+from .lint import changed_slots_with_parents, static_issues
 from .model import Graph, walk
 
 SNIPPET = Path(__file__).with_name("unity_verify.cs.txt")
@@ -37,13 +37,23 @@ STATUS_TEXT = {
 
 
 # Exit codes of the Unity CLI worth waiting out: no Editor answered, the request ran out of time, it is busy
-# (loading, compiling, reloading scripts).
+# (loading, compiling, reloading scripts, Safe Mode).
 TRANSIENT = {12, 14, 17}
+BAD_ARGS = 2
+COMMAND_FAILED = 6
+COMMAND_MISSING = 13
 AWAITING_INPUT = 18
+# com.unity.pipeline 1.0.0-pre.1 removed `script eval_file`: `script eval --file` takes its place, with the timeout
+# in seconds, and the result comes back as the bare value instead of an object.
+EVAL_FILE_PIPELINE = (1, 0, 0)
+DIALOG_HINT = (
+    "answer it in the Editor, or list it with `unity command editor dialog` and press a button with "
+    "`unity command editor dialog answer <id> <button>`"
+)
 
 
 class UnityUnavailable(Exception):
-    """The Editor cannot be reached (exit code 2)."""
+    """The Editor cannot be reached, or is not ready yet."""
 
     def __init__(self, message: str, code: Optional[int] = None):
         super().__init__(message)
@@ -52,6 +62,10 @@ class UnityUnavailable(Exception):
 
 class UnityFailed(Exception):
     """The Editor answered, but the verification snippet did not run."""
+
+
+class CommandMissing(UnityFailed):
+    """The Editor answered, but its Pipeline package has no such command, or not with these parameters."""
 
 
 # ---------------------------------------------------------------------------- CLI transport
@@ -75,6 +89,25 @@ def _find(obj, pred):
     return None
 
 
+def _result(doc):
+    """The value a command returned: bare on Pipeline 1.0 (``--result-only``), wrapped in envelopes before."""
+    while isinstance(doc, dict):
+        if "result" in doc:
+            doc = doc["result"]
+        elif isinstance(doc.get("data"), dict):
+            doc = doc["data"]
+        else:
+            break
+    return doc
+
+
+def _error_code(doc) -> str:
+    errors = doc.get("errors") if isinstance(doc, dict) else None
+    if isinstance(errors, list) and errors and isinstance(errors[0], dict):
+        return str(errors[0].get("code") or "")
+    return ""
+
+
 def _messages(doc) -> str:
     errors = _find(doc, lambda k, v: k == "errors" and isinstance(v, list) and v) or []
     texts = [e.get("message") or e.get("code") for e in errors if isinstance(e, dict)]
@@ -85,13 +118,52 @@ def _messages(doc) -> str:
     return "; ".join(t for t in texts if t)
 
 
-def _diagnostics(doc) -> List[str]:
+def _diagnostics(doc, text: str = "") -> List[str]:
+    """Compile errors of the snippet: ``diagnostics`` objects (Pipeline < 1.0) or ``line L, col C: error …`` lines."""
     diags = _find(doc, lambda k, v: k == "diagnostics" and isinstance(v, list) and v) or []
     out = []
     for d in diags:
         if isinstance(d, dict) and str(d.get("severity", "")).lower() == "error":
             out.append(f"line {d.get('line', '?')}: {d.get('message', '')}")
+    if not out:
+        out = [m.strip() for m in re.findall(r"line \d+, col \d+: [^\n;]*error[^\n]*", text)]
+    if not out and "COMPILATION_ERROR" in text:
+        out = [text.strip().splitlines()[-1]]
     return out
+
+
+def pipeline_version(project: Path) -> Optional[Tuple[int, int, int]]:
+    """Version of the project's com.unity.pipeline from its package lock (or manifest), if it names one."""
+    for name in ("packages-lock.json", "manifest.json"):
+        try:
+            deps = json.loads((project / "Packages" / name).read_text(encoding="utf-8")).get("dependencies", {})
+        except (OSError, ValueError, AttributeError):
+            continue
+        v = deps.get("com.unity.pipeline") if isinstance(deps, dict) else None
+        if isinstance(v, dict):
+            v = v.get("version")
+        m = re.match(r"(\d+)\.(\d+)\.(\d+)", v) if isinstance(v, str) else None
+        if m:
+            return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    return None
+
+
+def _status_rows(status) -> list:
+    data = status.get("data") if isinstance(status, dict) else None
+    if not isinstance(data, dict):
+        return []
+    rows = data.get("items") or data.get("instances") or []
+    return rows if isinstance(rows, list) else []
+
+
+def _compile_error_text(e) -> str:
+    if not isinstance(e, dict):
+        return str(e)
+    where = e.get("file")
+    if where and e.get("line") is not None:
+        where += f"({e.get('line')},{e.get('column', 1)})"
+    text = " ".join(str(x) for x in (e.get("code"), e.get("message")) if x)
+    return f"{where}: {text}" if where else text or str(e)
 
 
 class Editor:
@@ -99,50 +171,91 @@ class Editor:
         self.exe = exe
         self.project = project
         self.timeout = timeout
+        version = pipeline_version(project)
+        # True: `eval_file` (Pipeline < 1.0); False: `script eval --file`; None: unknown, try the new form first
+        self.legacy: Optional[bool] = None if version is None else version < EVAL_FILE_PIPELINE
 
-    def command(self, name: str, *args: str, timeout: Optional[float] = None) -> dict:
-        t = timeout or self.timeout
+    def command(self, name: str, *args: str, timeout: Optional[float] = None):
+        """Run ``unity command <name> <args>``; returns what the command returned (``_result`` unwraps it).
+
+        ``name`` may hold the group (``"script eval"``). The CLI's own options go before ``args``, which may hold a
+        ``--`` fence for the command's parameters."""
+        t = max(1, int(timeout or self.timeout))
         argv = [
             self.exe,
             "command",
-            name,
-            *args,
+            *name.split(),
             "--project-path",
             str(self.project),
-            "--json",
+            "--result-only",
             "--no-banner",
             "--non-interactive",
             "--timeout",
-            str(int(t)),
+            str(t),
             "--caller",
             "plugin",
             "--skill",
             "nodecanvas-cli",
+            *args,
         ]
         try:
             p = subprocess.run(argv, capture_output=True, text=True, timeout=t + 30)
         except FileNotFoundError as e:
             raise UnityUnavailable(f"cannot run {self.exe}: {e}") from e
         except subprocess.TimeoutExpired as e:
-            raise UnityFailed(f"unity command {name} did not answer in {int(t)} s") from e
+            raise UnityFailed(f"unity command {name} did not answer in {t} s") from e
         try:
-            doc = json.loads(p.stdout) if p.stdout.strip() else {}
+            doc = json.loads(p.stdout) if p.stdout.strip() else None
         except ValueError:
-            doc = {"raw": p.stdout}
-        ok = (
-            p.returncode == 0
-            and doc.get("success", True) is not False
-            and _find(doc, lambda k, v: k == "success" and v is False) is None
-        )
-        if not ok:
-            diags = _diagnostics(doc)
-            if diags:
-                raise UnityFailed("the verification snippet does not compile in this project: " + "; ".join(diags[:5]))
-            msg = _messages(doc) or (p.stderr.strip().splitlines() or [f"exit code {p.returncode}"])[-1]
-            if p.returncode == AWAITING_INPUT:
-                raise UnityFailed(f"a dialog in the Editor waits for an answer (`unity command editor dialog`): {msg}")
-            raise UnityUnavailable(msg, p.returncode)
-        return doc
+            doc = p.stdout.strip()
+        envelope_failed = isinstance(doc, dict) and doc.get("success") is False
+        if p.returncode == 0 and not envelope_failed:
+            return doc
+        code = _error_code(doc)
+        msg = _messages(doc) or (p.stderr.strip().splitlines() or [f"exit code {p.returncode}"])[-1]
+        diags = _diagnostics(doc, msg + "\n" + p.stderr)
+        if diags:
+            raise UnityFailed("the verification snippet does not compile in this project: " + "; ".join(diags[:5]))
+        if p.returncode == AWAITING_INPUT:
+            raise UnityFailed(f"a dialog in the Editor waits for an answer ({DIALOG_HINT}): {msg}")
+        if p.returncode == COMMAND_MISSING or code in ("REMOTE_COMMAND_NOT_FOUND", "INVALID_COMMAND_ARGS"):
+            raise CommandMissing(msg)
+        if code == "EDITOR_NOT_READY":
+            raise UnityUnavailable(msg, 17)  # busy after the CLI's own retries: worth waiting out
+        if p.returncode == BAD_ARGS:
+            raise UnityFailed(f"the Unity CLI rejected the call (`unity upgrade` updates it): {msg}")
+        if p.returncode == COMMAND_FAILED and code not in ("EDITOR_UNREACHABLE",):
+            raise UnityFailed(f"unity command {name} failed in the Editor: {msg}")
+        raise UnityUnavailable(msg, p.returncode)
+
+    def eval(self, code: str, timeout: Optional[float] = None):
+        return _result(self.command("script eval", code, timeout=timeout))
+
+    def eval_file(self, path: str, timeout: float):
+        """Run a C# file in the Editor: ``script eval --file`` (Pipeline 1.0), else the older ``eval_file``."""
+        if not self.legacy:
+            try:
+                return self.command(
+                    "script eval", "--", "--file", path, "--timeout", str(max(1, int(timeout))), timeout=timeout
+                )
+            except CommandMissing as e:
+                if self.legacy is False:
+                    raise CommandMissing(
+                        f"the project's com.unity.pipeline cannot run a C# file ({e}); "
+                        "`unity pipeline upgrade` updates it"
+                    ) from e
+                self.legacy = True
+        ms = str(int(timeout * 1000))
+        try:
+            return self.command("script eval_file", path, ms, timeout=timeout)
+        except CommandMissing:
+            try:
+                return self.command("eval_file", path, ms, timeout=timeout)
+            except CommandMissing as e:
+                raise CommandMissing(
+                    f"the project's com.unity.pipeline has no command to run a C# file ({e}); "
+                    "`unity pipeline upgrade` updates it"
+                ) from e
 
     def _status(self, *args: str, timeout: float = 30) -> dict:
         """``unity status`` for this project; it reads the Editor's state without connecting to it."""
@@ -150,14 +263,15 @@ class Editor:
         argv.append("--non-interactive")
         try:
             p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout + 30)
-            return json.loads(p.stdout) if p.stdout.strip() else {}
+            doc = json.loads(p.stdout) if p.stdout.strip() else {}
+            return doc if isinstance(doc, dict) else {}
         except (OSError, subprocess.TimeoutExpired, ValueError):
             return {}
 
     def _editor_open(self, status: dict) -> bool:
         """The project has an Editor: listed by ``unity status`` or holding Unity's lock on the project."""
         count = _find(status, lambda k, v: k == "count" and isinstance(v, int))
-        return bool(count) or (self.project / "Temp" / "UnityLockfile").exists()
+        return bool(_status_rows(status)) or bool(count) or (self.project / "Temp" / "UnityLockfile").exists()
 
     def connect(self, limit: float, log=None) -> None:
         """First contact. An Editor that is compiling or reloading scripts (right after `unity recompile`, say)
@@ -170,12 +284,27 @@ class Editor:
                 return
             except UnityUnavailable as e:
                 status = self._status()
+                code = _error_code(status)
                 errors = _find(status, lambda k, v: k == "compileErrors" and isinstance(v, list) and v)
-                if errors:
-                    texts = [x.get("message", str(x)) if isinstance(x, dict) else str(x) for x in errors[:5]]
+                if errors or code == "STATUS_SAFE_MODE":
+                    texts = [_compile_error_text(x) for x in (errors or [])[:5]] or ["see the Editor log"]
                     raise UnityFailed("the Editor is in Safe Mode, scripts do not compile: " + "; ".join(texts)) from e
-                listed = bool(_find(status, lambda k, v: k == "count" and isinstance(v, int)))
-                if not self._editor_open(status) or time.monotonic() > deadline:
+                if code.startswith("STATUS_BLOCKED_BY_DIALOG"):
+                    dialogs = _find(status, lambda k, v: k == "dialogs" and isinstance(v, list) and v) or []
+                    titles = [d.get("title") for d in dialogs if isinstance(d, dict) and d.get("title")]
+                    what = f" ({', '.join(titles)})" if titles else ""
+                    raise UnityFailed(f"a dialog in the Editor waits for an answer{what}: {DIALOG_HINT}") from e
+                pending = code == "STATUS_PIPELINE_LOAD_PENDING"
+                listed = bool(_status_rows(status)) or bool(
+                    _find(status, lambda k, v: k == "count" and isinstance(v, int))
+                )
+                if not (self._editor_open(status) or pending) or time.monotonic() > deadline:
+                    if pending:
+                        raise UnityUnavailable(
+                            f"{e}; the Editor has not loaded com.unity.pipeline yet "
+                            "(restart it; Unity 6000.5.0 to 6000.5.2 cannot start the package)",
+                            e.code,
+                        ) from e
                     raise
                 if noted and listed and e.code not in TRANSIENT:
                     raise  # it is there and ready, and this is not about being busy
@@ -187,11 +316,10 @@ class Editor:
                     time.sleep(1.0)
 
     def busy(self) -> bool:
-        doc = self.command("eval", BUSY, timeout=60)
-        return _find(doc, lambda k, v: k == "result" and isinstance(v, bool)) is True
+        return self.eval(BUSY, timeout=60) is True
 
     def refresh(self) -> None:
-        self.command("eval", "AssetDatabase.Refresh(); " + BUSY, timeout=120)
+        self.eval("AssetDatabase.Refresh(); " + BUSY, timeout=120)
 
     def wait_ready(self, limit: float, log=None) -> None:
         """Wait until the Editor is neither compiling nor importing; a domain reload drops the connection
@@ -292,10 +420,10 @@ def _console(entries: List[dict], verbose: bool) -> List[Tuple[str, str]]:
 
 
 def _run_snippet(editor: Editor, path: str, timeout: float, deadline: float, log) -> dict:
-    """``eval_file``, again after a wait if a script reload took the Editor away in the meantime."""
+    """The snippet file, again after a wait if a script reload took the Editor away in the meantime."""
     while True:
         try:
-            return editor.command("eval_file", path, str(int(timeout * 1000)))
+            return editor.eval_file(path, timeout)
         except UnityUnavailable as e:
             left = deadline - time.monotonic()
             if e.code not in TRANSIENT or left <= 0:
@@ -314,7 +442,7 @@ def cmd_verify(ws, a) -> int:
         print("error: name graphs or pass --changed, not both", file=sys.stderr)
         return 2
     if a.changed:
-        slots = ws.changed_slots()
+        slots = changed_slots_with_parents(ws, quiet=a.json)
         if not slots:
             print("no changed graphs (git diff HEAD + untracked files)")
             return 0

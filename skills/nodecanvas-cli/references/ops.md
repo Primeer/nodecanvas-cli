@@ -82,7 +82,7 @@ Task specs accept `_isDisabled`, `_invert` (conditions) and `agent` (`"$Var"`, t
 | `disable` | `from`, `to`, `value`? | Disables (or with `"value": false` re-enables) a connection. |
 | `set-start` | `node` | Makes the node the graph's start/root (BT root must have no parent). |
 | `simplify` | `node`? | Removes Merge nodes with at most one parent (in the subtree of `node`, or everywhere). |
-| `layout` | `node`? | Re-lays out the subtree of `node` (default: root) on the grid. The subtree root itself is snapped to the grid and placed `level_gap` below its parent (the graph root only gets snapped). |
+| `layout` | `node`? | Re-lays out the subtree of `node` (default: root) on the grid by node size. The subtree root itself is snapped to the grid and placed `level_gap` below its parent (the graph root only gets snapped). Same as the `nodecanvas-cli layout` command, which can also take exact sizes from Unity. |
 
 Connection limits (max children/parents per node type, one parent per BT node except Merge) are checked
 once after the whole batch, so a node may temporarily have too many children inside a batch. Cycles
@@ -103,7 +103,7 @@ syntax as the `map` operation; `nodecanvas-cli node` prints them that way.
 | Op | Fields | Notes |
 |---|---|---|
 | `var-add` | `name`, `type`, `value`?, `public`?, `after`?/`before`?/`index`? | `type` is C# (`float`, `bool`, `Vector3`, `Pawn`, `List<Pawn>`). Without a position the variable goes last. `after`/`before` name a variable or a section (`"after": "Parameters"`); `index` counts sections too. |
-| `var-set` | `name`, `value`?, `public`?, `type`? | Changes the stored value / exposure / type. `type` keeps the id, so references stay; the old value is converted between primitive types, kept between object types, otherwise dropped (a note says so). Bindings the new type breaks are refused by lint. |
+| `var-set` | `name`, `value`?, `public`?, `type`? | Changes the stored value / exposure / type. `type` keeps the id, so references stay; the old value is converted between primitive types, kept between object types, otherwise dropped (a note says so). Bindings the new type breaks are refused by lint. Parent graphs mapping the variable keep the old type in that mapping: a note names them, and `lint` on each gives a `fix:` (`stale-mapping-type`). |
 | `var-move` | `name`, `after`/`before`/`index` | Moves a variable, for example from `Local variables` into `Parameters`. |
 | `var-rename` | `name`, `to` | Updates every reference in this graph. Subgraph mappings in *other* graphs keep working (they use ids). |
 | `var-remove` | `name`, `force`? | Refuses while the variable is used, unless `force`. |
@@ -146,23 +146,34 @@ Statements: `{"$type": "StatementNode", "_actorName": "Guard", "statement": {"_t
 ## Layout and ids
 
 - Only created or moved nodes are positioned; existing nodes move only to make room. Coordinates are on
-  the NodeCanvas editor grid (20 px). A BT child sits `level_gap` (200 px = 10 cells) below its parent;
-  nodes on one row are at least `sibling_gap` (300 px = 15 cells) apart. When there is no room between
-  siblings, the siblings to the right shift with their subtrees, and branches that would overlap nodes
-  of neighbouring subtrees are pushed apart. Siblings keep a left-to-right order matching the child list
-  (the NodeCanvas editor re-sorts children by x when a node is dragged). Moved subtrees keep their
-  internal layout. `wrap` puts the wrapper in the wrapped node's place and moves that subtree one level
-  down; `unwrap` moves the child up into the removed node's place.
-- FSM/DT nodes are placed `sibling_gap` to the right of their source (or the rightmost node), moving down
-  a row while that spot is taken.
+  the NodeCanvas editor grid (20 px). The editor never saves a node's size, so it is estimated from the
+  node's text after the whole batch; `_position` is the top-left corner. A BT child sits `level_gap`
+  (100 px) below its parent's bottom edge, or in the row of its siblings; nodes on one row keep
+  `sibling_gap` (60 px) between their edges. When there is no room between siblings, the siblings to the
+  right shift with their subtrees, and branches that would overlap nodes of neighbouring subtrees are
+  pushed apart. Siblings keep a left-to-right order matching the child list (the NodeCanvas editor
+  re-sorts children by their centre x when a node is dragged). Moved subtrees keep their internal layout.
+  `wrap` puts the wrapper in the wrapped node's place and moves that subtree below it; `unwrap` moves the
+  child up into the removed node's place.
+- FSM/DT nodes are placed `sibling_gap` past the right edge of their source (or the rightmost node), moving
+  down a row while that spot is taken.
 - After every batch `apply` prints a summary, e.g.
   `layout: placed 1 new, moved 0 by the edit, shifted 5 existing to make room:` followed by
-  `#5 subtree (2 nodes) +400,0` lines (ids after renumbering). `apply --positions` adds coordinates to
-  the before/after diff; `show --positions` / `diff --positions` print them for the whole graph.
+  `#5 subtree (2 nodes) +400,0` lines (ids after renumbering) and `sizes: estimated 11`, where sizes came
+  from. `apply --positions` adds coordinates to the before/after diff; `show --positions` /
+  `diff --positions` print them for the whole graph.
+- `nodecanvas-cli layout <graph> [--node N] [--dry-run]` tidies a whole tree. `--unity` takes exact sizes
+  from the open Editor (`.asset` graphs only) by drawing the graph in the NodeCanvas window: nothing is
+  saved in Unity, the window goes back to its graph or closes. It fails without an Editor, and a node the
+  Editor did not draw keeps its estimate (`sizes: unity 12, estimated 3`). `apply` never asks Unity, so an
+  edit gives the same result on any machine.
+- `nodecanvas-cli calibrate --unity [graph...]` prints how far estimates are from the Editor; `--write`
+  saves the fitted `layout.char_width`.
 - `nodecanvas-cli node <graph> <id>... --raw` always returns `{"<id>": {"node": ..., "out": [...]}}`.
 - Zero coordinates are omitted from `_position`, as FullSerializer does.
 - The values come from `nodecanvas-cli.json` in the Unity project root, if present:
-  `{"layout": {"grid": 20, "level_gap": 200, "sibling_gap": 300}}`. Use `set` on `_position` to place
-  a node yourself.
+  `{"layout": {"grid": 20, "level_gap": 100, "sibling_gap": 60}}`. With `"sizing": "fixed"` nodes count as
+  points and the gaps (200 and 300 by default) are distances between top-left corners. Use `set` on
+  `_position` to place a node yourself.
 - After every batch, nodes are renumbered like the NodeCanvas editor does (depth-first from the root),
   so always re-run `show` before writing the next batch.

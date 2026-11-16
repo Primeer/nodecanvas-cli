@@ -1,5 +1,6 @@
-// nodecanvas-cli verify --unity: executed by the Unity Pipeline `eval_file` command inside the open Editor.
-// The body of a static `object Execute()` method; nodecanvas-cli substitutes TARGETS and RESAVE.
+// nodecanvas-cli verify --unity: executed in the open Editor by `unity command script eval --file`
+// (Roslyn script mode; `eval_file` on a com.unity.pipeline older than 1.0).
+// Top-level statements ending in `return`; nodecanvas-cli substitutes TARGETS and RESAVE.
 var targets = new string[][] { /*TARGETS*/ };
 var resave = /*RESAVE*/;
 var flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;

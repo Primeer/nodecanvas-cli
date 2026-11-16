@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, NamedTuple, Optional
 
 from .config import load as load_config
 from .container import ContainerError, ObjectRef, Slot, UnityFile
-from .model import Graph, GraphError
+from .model import NESTED_KEYS, Graph, GraphError
 from .project import Project, find_project_root
 from .render import Renderer
 from .schema import Schema
@@ -16,6 +16,14 @@ from .typedwalk import prune_refs
 from .typenames import TypeNames
 
 SUPPORTED_MAJOR = 3
+
+
+class SubgraphLink(NamedTuple):
+    """A node of ``parent`` that runs the graph asset at ``path``."""
+
+    parent: Graph
+    node: dict
+    path: str
 
 
 class Workspace:
@@ -27,6 +35,7 @@ class Workspace:
         self._graphs: Dict[str, Graph] = {}
         self._slots: Optional[List[Slot]] = None
         self._types: Optional[TypeNames] = None
+        self._links: Optional[List[SubgraphLink]] = None
 
     @property
     def types(self) -> TypeNames:
@@ -138,6 +147,14 @@ class Workspace:
         paths = {p.strip() for p in diff + new if p.strip()}
         return [s for s in self.slots if s.path in paths]
 
+    def parents_of(self, slots: List[Slot]) -> List[Slot]:
+        """Graphs directly running one of ``slots`` as a subgraph, without ``slots`` themselves. What a parent stores
+        about a subgraph's variables is checked in the parent, so a changed subgraph concerns it as well."""
+        paths = {s.path for s in slots}
+        known = {s.address for s in slots}
+        found = {link.parent.loaded.slot.address for link in self.subgraph_links() if link.path in paths}
+        return [s for s in self.slots if s.address in found - known]
+
     def all_graphs(self) -> List[Graph]:
         out = []
         for s in self.slots:
@@ -148,6 +165,21 @@ class Workspace:
         return out
 
     # ------------------------------------------------------------------ references
+
+    def subgraph_links(self) -> List[SubgraphLink]:
+        """Every use of a graph asset as a subgraph, in graph and node order (computed once until a save)."""
+        if self._links is None:
+            links = []
+            for g in self.all_graphs():
+                for n in g.nodes:
+                    for k in NESTED_KEYS:
+                        p = n.get(k)
+                        ref = g.ref(p["_value"]) if isinstance(p, dict) and "_value" in p else None
+                        path = self.ref_path(ref) if ref is not None else None
+                        if path:
+                            links.append(SubgraphLink(g, n, path))
+            self._links = links
+        return self._links
 
     def ref_path(self, ref: ObjectRef) -> Optional[str]:
         if ref.guid:
@@ -184,6 +216,7 @@ class Workspace:
         self.slots.append(graph.loaded.slot)
         self._graphs[graph.loaded.slot.address] = graph
         self.project.guid_to_path[guid] = f.relpath
+        self._links = None
 
     # ------------------------------------------------------------------ saving
 
@@ -202,3 +235,4 @@ class Workspace:
         self._files.pop(path, None)
         self._graphs = {k: v for k, v in self._graphs.items() if v.loaded.slot.path != path}
         self._slots = None
+        self._links = None

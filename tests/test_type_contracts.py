@@ -306,3 +306,118 @@ def test_vars_and_show_name_the_pawn(ncg, pawns):
     assert _apply(ncg, pawns, "Bot_BT", [{"op": "var-add", "name": "P", "type": "Arena.Pawn"}])[0] == 0
     assert "$P: Demo.Arena.Pawn" in ncg("vars", "Bot_BT")[1]
     assert "P:Demo.Arena.Pawn" in ncg("show", "Bot_BT")[1]
+
+
+# ---------------------------------------------------------------------- stale `_type` in a mapping
+
+
+@pytest.mark.parametrize(
+    "stored,actual,level",
+    [
+        ("System.Single", "System.Single", None),
+        ("Demo.Arena.Pawn, Asm, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null", "Demo.Arena.Pawn", None),
+        (
+            "System.Collections.Generic.List`1[[Demo.Arena.Pawn, A, Version=1]]",
+            "System.Collections.Generic.List`1[[Demo.Arena.Pawn, B, Version=2]]",
+            None,
+        ),
+        ("Demo.Arena.Hero", "Demo.Arena.Pawn", "info"),
+        ("System.Single", "System.Int32", "error"),  # converts, but a boxed float does not cast to int
+        ("System.Int32", "System.Single", "error"),
+        ("Demo.Meta.Pawn", "Demo.Arena.Pawn", "error"),
+        ("Demo.Arena.Pawn", "Demo.Arena.Hero", "error"),
+        ("TMPro.TMP_Text", "Demo.Arena.Pawn", "warning"),
+    ],
+)
+def test_stored_type_severity(ncg, pawns, stored, actual, level):
+    from nodecanvas_cli.typerel import stored_type_severity
+    from nodecanvas_cli.workspace import Workspace
+
+    assert stored_type_severity(Workspace(pawns).schema, stored, actual) == level
+
+
+def _mapped_float(ncg, project, value="<-$Mine"):
+    """Sub_BT has a public float $Shared, mapped in Bot_BT #8."""
+    assert (
+        _apply(ncg, project, "Sub_BT", [{"op": "var-add", "name": "Shared", "type": "float", "public": True}])[0] == 0
+    )
+    ops = [{"op": "var-add", "name": "Mine", "type": "float"}, {"op": "map", "node": "8", "map": {"Shared": value}}]
+    assert _apply(ncg, project, "Bot_BT", ops)[0] == 0
+    assert not [i for i in _lint(ncg, "Bot_BT") if i["code"] == "stale-mapping-type"]
+
+
+def _stale(ncg):
+    return [i for i in _lint(ncg, "Bot_BT") if i["code"] == "stale-mapping-type"]
+
+
+def test_var_set_type_leaves_a_stale_mapping_type_that_lint_reports(ncg, project):
+    _mapped_float(ncg, project)
+    code, out, _ = _apply(ncg, project, "Sub_BT", [{"op": "var-set", "name": "Shared", "type": "int"}])
+    assert code == 0
+    assert "Bot_BT #8 maps $Shared and now stores the old type" in out and "lint Bot_BT" in out
+    issue = _stale(ncg)[0]
+    assert issue["severity"] == "error" and issue["at"] == "#8"
+    assert "Sub_BT.$Shared: the mapping stores type Single, the variable is Int32" in issue["message"]
+    assert ncg("lint", "Bot_BT")[0] == 1
+
+
+def test_stale_mapping_type_fix_applies(ncg, project):
+    _mapped_float(ncg, project)
+    assert _apply(ncg, project, "Sub_BT", [{"op": "var-set", "name": "Shared", "type": "int"}])[0] == 0
+    fix = _stale(ncg)[0]["fix"]
+    assert fix["path"].startswith("_variablesMap.") and fix["value"] == "System.Int32"
+    assert _apply(ncg, project, "Bot_BT", [fix])[0] == 0
+    assert not _stale(ncg)
+
+
+def test_stale_mapping_type_of_a_literal_has_no_fix(ncg, project):
+    _mapped_float(ncg, project, 2.5)
+    assert _apply(ncg, project, "Sub_BT", [{"op": "var-set", "name": "Shared", "type": "int"}])[0] == 0
+    issue = _stale(ncg)[0]
+    assert issue["fix"] is None and "map it again" in issue["message"]
+
+
+def test_inactive_mapping_entry_is_not_reported(ncg, project):
+    _mapped_float(ncg, project)
+    assert _apply(ncg, project, "Sub_BT", [{"op": "var-set", "name": "Shared", "type": "int"}])[0] == 0
+    entries = json.loads(ncg("node", "Bot_BT", "8", "--raw")[1])["8"]["node"]["_variablesMap"]
+    index = int(_stale(ncg)[0]["fix"]["path"].split(".")[1])
+    entries[index].pop("_canWrite", None)
+    entries[index].pop("_canRead", None)
+    ops = [{"op": "set", "node": "8", "path": "_variablesMap", "raw": True, "value": entries}]
+    assert _apply(ncg, project, "Bot_BT", ops)[0] == 0
+    assert not _stale(ncg)
+
+
+def test_retype_to_the_same_type_does_not_claim_a_stale_mapping(ncg, project):
+    _mapped_float(ncg, project)
+    _, out, _ = _apply(ncg, project, "Sub_BT", [{"op": "var-set", "name": "Shared", "type": "float"}])
+    assert "stores the old type" not in out
+
+
+def _git_baseline(project):
+    import subprocess
+
+    for args in (("init", "-q"), ("add", "-A"), ("commit", "-qm", "base")):
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=project, check=True, capture_output=True
+        )
+
+
+def test_lint_changed_includes_parents_of_a_changed_subgraph(ncg, project):
+    _mapped_float(ncg, project)
+    _git_baseline(project)
+    assert _apply(ncg, project, "Sub_BT", [{"op": "var-set", "name": "Shared", "type": "int"}])[0] == 0
+    code, out, err = ncg("lint", "--changed")
+    assert code == 1 and "stale-mapping-type" in out and "Assets/Graphs/Bot_BT.asset" in out
+    assert "also checking 2 parent graph(s)" in err  # Bot_BT and Bot_FSM run Sub_BT
+    issues = json.loads(ncg("lint", "--changed", "--json")[1])  # stays valid JSON
+    assert any(i["code"] == "stale-mapping-type" for i in issues)
+
+
+def test_lint_changed_leaves_unrelated_graphs_out(ncg, project):
+    _git_baseline(project)
+    assert _apply(ncg, project, "Patrol_BT", [{"op": "var-add", "name": "N", "type": "int"}])[0] == 0
+    code, out, err = ncg("lint", "--changed", "--json", "--min", "info")
+    assert {i["graph"] for i in json.loads(out)} <= {"Assets/Graphs/Patrol_BT.asset"}
+    assert "also checking" not in err

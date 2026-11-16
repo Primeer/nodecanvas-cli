@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+## 0.4.0 — 2026-11-16
+
+- `verify --unity`, `layout --unity` and `calibrate --unity` work with the Unity CLI 1.0 and `com.unity.pipeline` 1.0,
+  which removed `eval_file` and returns a command's result without the old wrapper: the snippet runs through
+  `unity command script eval --file` with its timeout in seconds. A package older than 1.0 (read from
+  `Packages/packages-lock.json`, or found by trying) still gets `eval_file`. A failed check in the Editor and a
+  snippet that does not compile are reported as such (exit 1), no longer as "no Editor reachable". `unity status`
+  is read in its current shape: Safe Mode lists compile errors with file and line, an Editor stopped on a modal
+  dialog fails at once with the dialog's title and the `unity command editor dialog` hint, and an Editor that has
+  not loaded the Pipeline package yet is waited for.
+- Layout accounts for node size. The editor never saves a node's size, so it is estimated from the node's text: `info`
+  of the tasks NodeCanvas ships, labels of built-in nodes, title and icon. Wide nodes no longer overlap their neighbours,
+  and parents centre over their children. **Possibly breaking:** the default layout changes, and in
+  `nodecanvas-cli.json` `level_gap` and `sibling_gap` now mean clear space between node edges (100 and 60 by default).
+  `"sizing": "fixed"` keeps the old layout and meaning (200 and 300 between top-left corners).
+- New `layout <graph> [--node N] [--unity] [--dry-run]` command and MCP tool. `--unity` takes exact sizes from the open
+  Editor, for `.asset` graphs, and fails without one. `apply` always estimates, so an edit does not depend on Unity.
+  Subtrees pack by their contours, so a shallow branch can sit above a deeper neighbour; `"sizing": "fixed"` keeps
+  consecutive slots for leaves.
+- New `calibrate --unity [--write]`: compares estimates with the Editor and stores `layout.char_width`.
+- `lint`: `overlap` uses estimated node sizes instead of the 80×20 minimum, and `child-order` compares centres, which
+  is what the editor sorts by.
+- `lint`: new `stale-mapping-type`. A subgraph mapping stores the type of the subgraph's variable, and after that
+  type changes (`var-set type`, or in C#) it stays old until the node is drawn in the editor, while NodeCanvas keeps
+  converting values to it. An error when the cast to the variable's type cannot succeed, with a `fix:` op.
+  `verify --unity` reports it too.
+- `lint --changed` and `verify --changed` also check the direct parents of changed subgraphs: mapping checks live in
+  the parent, so a subgraph-only change used to pass.
+- `var-set type` names the parent graphs that map the variable.
+
 ## 0.3.0 — 2026-11-06
 
 - `refactor rename-member`: several renames in one run — `Type.Old=New` pairs (`Type.Old(P1,P2)=New` picks an

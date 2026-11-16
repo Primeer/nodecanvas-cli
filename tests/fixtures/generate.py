@@ -287,7 +287,7 @@ def bot_bt():
                 "overrideAgent": agent,
                 "$type": "NodeCanvas.Tasks.Actions.ExecuteFunction_Multiplatform",
             },
-            "_position": {"x": 100.0, "y": 420.0},
+            "_position": {"x": 220.0, "y": 420.0},
             "$type": "NodeCanvas.BehaviourTrees.ActionNode",
         },
         # 8
@@ -309,7 +309,7 @@ def bot_bt():
                     "_targetVariableID": V["alert"],
                 },
             ],
-            "_position": {"x": 300.0, "y": 420.0},
+            "_position": {"x": 500.0, "y": 420.0},
             "$type": "NodeCanvas.BehaviourTrees.SubTree",
         },
         # 9

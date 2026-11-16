@@ -304,6 +304,9 @@ def build_parser() -> argparse.ArgumentParser:
     from . import verify as verify_mod
 
     verify_mod.register(sub)
+    from . import unity_sizes as unity_sizes_mod
+
+    unity_sizes_mod.register(sub)
     return p
 
 

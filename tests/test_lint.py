@@ -51,7 +51,7 @@ def test_types_explains_non_task_types(ncg):
 def test_layout_checks(ncg, project):
     ops = [
         {"op": "set", "node": "3", "path": "_position", "value": [230, 285]},
-        {"op": "set", "node": "7", "path": "_position", "value": [310, 420]},
+        {"op": "set", "node": "7", "path": "_position", "value": [530, 420]},
     ]
     (project / "ops.json").write_text(json.dumps(ops))
     assert ncg("apply", "Bot_BT", project / "ops.json", "--force")[0] == 0

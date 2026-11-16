@@ -19,7 +19,8 @@ from .build import Builder, BuildError
 from .layout import Layouter
 from .lint import ERROR, lint_graph
 from .model import NESTED_KEYS, Graph, GraphError, walk
-from .schema import simple_name
+from .nodesize import Size, workspace_sizes
+from .schema import bare_name, simple_name
 from .typedwalk import prune_refs
 from .typenames import ALIASES
 from .views import render_graph
@@ -45,15 +46,17 @@ class OpError(Exception):
 
 
 class Editor:
-    def __init__(self, ws, g: Graph):
+    def __init__(self, ws, g: Graph, measured: Optional[Dict[int, Size]] = None):
         self.ws = ws
         self.g = g
         self.b = Builder(ws, g)
         self.handles: Dict[str, dict] = {str(i): n for i, n in enumerate(g.nodes)}
         self.lay = Layouter(g, ws.config.layout)
+        self.measured = measured or {}  # sizes reported by the Unity Editor, by id(node)
         self.place_roots: List[dict] = []  # created or moved: need a slot under their parent
         self.check_roots: List[dict] = []  # kept in place: only checked for overlaps
         self.relayout_roots: List[dict] = []  # explicit "layout" op
+        self.wrap_shifts: List[tuple] = []  # (wrapper, nodes that go below it): needs the wrapper's final size
         self.notes: List[str] = []
         self.before = {id(n): self.lay.pos(n) for n in g.nodes}
         self.op_moved: set = set()
@@ -279,7 +282,7 @@ class Editor:
         if old is not None and self.g.kind == "bt":
             self.place_roots.remove(wrapper)
             self.lay.set(wrapper, self.lay.snap(old[0]), self.lay.snap(old[1]))
-            self.lay.translate([node], 0.0, self.ws.config.layout.level_gap)
+            self.wrap_shifts.append((wrapper, [m for m in self.lay.subtree(node) if self.lay.pos(m) is not None]))
             self.check_roots.append(wrapper)
         if parents:
             p = parents[0]
@@ -511,12 +514,23 @@ class Editor:
         if users:
             shown = self.ws.schema.display_pair(old, new) if old else ("?", new)
             self.notes.append(f"${name}: type {shown[0]} -> {shown[1]}; used by " + " ".join(users))
-        if var.get("_isPublic") and not self.g.loaded.slot.bound:
-            from .owners import subgraph_parents
-
-            parents = subgraph_parents(self.ws).get(self.g.loaded.slot.path, [])
-            if parents:
-                self.notes.append(f"${name} is public; parent graphs may map it, run lint on: " + ", ".join(parents))
+        if self.g.loaded.slot.bound:
+            return
+        links = [link for link in self.ws.subgraph_links() if link.path == self.g.loaded.slot.path]
+        mapping = [
+            link
+            for link in links
+            if any(m.get("_targetSubGraphVariableID") == var.get("_id") for m in link.node.get("_variablesMap") or [])
+        ]
+        if mapping and (not old or bare_name(old) != bare_name(new)):
+            for link in mapping:
+                self.notes.append(
+                    f"{link.parent.name} #{link.parent.nid(link.node)} maps ${name} and now stores the old type; "
+                    f"`nodecanvas-cli lint {link.parent.name}` gives the fix"
+                )
+        elif links and var.get("_isPublic"):
+            shown = ", ".join(f"{link.parent.name} #{link.parent.nid(link.node)}" for link in links)
+            self.notes.append(f"${name} is public; parent graphs may map it, run lint on: " + shown)
 
     def _retype_value(self, var: dict, old: Any, new: str, was_object: bool, name: str) -> None:
         """Keep the stored value when it still means something for the new type, otherwise drop it and say so."""
@@ -735,8 +749,29 @@ class Editor:
 
     # ------------------------------------------------------------------ positions
 
+    def _measure(self) -> None:
+        """Node sizes for this layout: taken after all operations, since a task's text sets its node's width."""
+        if self.ws.config.layout.sizing == "content":
+            self.lay.sizes = {**workspace_sizes(self.ws, self.g), **self.measured}
+
+    def sizes_note(self) -> str:
+        if self.ws.config.layout.sizing != "content":
+            return ""
+        unity = sum(1 for n in self.g.nodes if id(n) in self.measured)
+        estimated = len(self.g.nodes) - unity
+        parts = ([f"unity {unity}"] if unity else []) + ([f"estimated {estimated}"] if estimated else [])
+        return "sizes: " + ", ".join(parts)
+
     def layout(self) -> None:
         alive = lambda n: any(x is n for x in self.g.nodes)  # noqa: E731
+        self._measure()
+        for wrapper, below in self.wrap_shifts:
+            if alive(wrapper):
+                dy = self.lay.child_shift(wrapper)
+                for m in below:
+                    if alive(m):
+                        x, y = self.lay.pos(m)
+                        self.lay.set(m, x, y + dy)
         if self.g.kind != "bt":
             for n in self.place_roots:
                 if alive(n) and self.lay.pos(n) is None:
@@ -783,13 +818,15 @@ class Editor:
             f"layout: placed {len(new)} new, moved {len(moved)} by the edit, "
             f"shifted {len(shifted)} existing to make room"
         )
+        note = self.sizes_note()
+        tail = f"\n  {note}" if note else ""
         if not groups:
-            return head
+            return head + tail
         parts = [
             f"#{nid}" + (f" subtree ({size} nodes)" if size > 1 else "") + f" {_signed(d[0])},{_signed(d[1])}"
             for nid, size, d in groups
         ]
-        return head + ":\n  " + "\n  ".join(parts)
+        return head + ":\n  " + "\n  ".join(parts) + tail
 
 
 OPS = {
@@ -854,8 +891,8 @@ def _parse_path(path) -> list:
     return out
 
 
-def apply_ops(ws, g: Graph, ops: List[dict]) -> Editor:
-    ed = Editor(ws, g)
+def apply_ops(ws, g: Graph, ops: List[dict], measured: Optional[Dict[int, Size]] = None) -> Editor:
+    ed = Editor(ws, g, measured)
     for i, op in enumerate(ops):
         name = op.get("op")
         fn = OPS.get(name)

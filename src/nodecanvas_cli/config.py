@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 CONFIG_NAME = "nodecanvas-cli.json"
+SIZING_MODES = ("content", "fixed")
 
 
 class ConfigError(Exception):
@@ -16,8 +18,19 @@ class ConfigError(Exception):
 @dataclass
 class Layout:
     grid: float = 20.0  # NodeCanvas editor grid (GraphEditor.GRID_SIZE)
-    level_gap: float = 200.0  # parent -> child, 10 grid cells
-    sibling_gap: float = 300.0  # minimum horizontal distance between nodes on one row
+    # "content": gaps are clear space between node edges, sizes come from the node's text.
+    # "fixed": nodes count as points and gaps are distances between their top-left corners.
+    sizing: str = "content"
+    level_gap: Optional[float] = None  # parent -> child: 100 clear px ("content"), 200 px ("fixed")
+    sibling_gap: Optional[float] = None  # neighbours on one row: 60 clear px ("content"), 300 px ("fixed")
+    char_width: Optional[float] = None  # px per regular character, see `nodecanvas-cli calibrate --unity`
+
+    def __post_init__(self) -> None:
+        fixed = self.sizing == "fixed"
+        if self.level_gap is None:
+            self.level_gap = 200.0 if fixed else 100.0
+        if self.sibling_gap is None:
+            self.sibling_gap = 300.0 if fixed else 60.0
 
 
 @dataclass
@@ -34,7 +47,7 @@ class Config:
 
 def load(root: Path) -> Config:
     path = root / CONFIG_NAME
-    layout = Layout()
+    layout = {}
     scaffold = Scaffold()
     if path.exists():
         try:
@@ -47,11 +60,16 @@ def load(root: Path) -> Config:
             if not isinstance(raw.get(section) or {}, dict):
                 raise ConfigError(f"{path}: {section} must be an object")
         for k, v in (raw.get("layout") or {}).items():
-            if not hasattr(layout, k):
+            if k == "sizing":
+                if v not in SIZING_MODES:
+                    raise ConfigError(f"{path}: layout.sizing must be one of {', '.join(SIZING_MODES)}")
+                layout[k] = v
+                continue
+            if not hasattr(Layout(), k):
                 raise ConfigError(f"{path}: unknown layout setting {k!r}")
-            if not isinstance(v, (int, float)) or v <= 0:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
                 raise ConfigError(f"{path}: layout.{k} must be a positive number")
-            setattr(layout, k, float(v))
+            layout[k] = float(v)
         for k, v in (raw.get("scaffold") or {}).items():
             if k == "comments" and isinstance(v, bool):
                 scaffold.comments = v
@@ -59,4 +77,4 @@ def load(root: Path) -> Config:
                 scaffold.indent = " " * v if isinstance(v, int) else v
             else:
                 raise ConfigError(f"{path}: bad scaffold setting {k!r}")
-    return Config(layout, scaffold)
+    return Config(Layout(**layout), scaffold)

@@ -21,7 +21,7 @@ from typing import Dict, List, Optional, Tuple
 from . import fsjson
 from .assetrefs import refs_to
 from .container import ObjectRef, _documents, _value_of
-from .model import NESTED_KEYS, Graph, walk
+from .model import Graph, walk
 from .project import Cache
 from .schema import bare_name, generic_args, short_generic
 from .yamlscalar import find_scalar
@@ -650,15 +650,8 @@ def describe_owner(ws, idx: Index, o: Owner, g: Optional[Graph]) -> List[str]:
 def subgraph_parents(ws) -> Dict[str, List[str]]:
     """``asset path -> ["Parent #node", ...]`` for graphs used as subgraphs / nested graphs."""
     out: Dict[str, List[str]] = {}
-    for pg in ws.all_graphs():
-        for n in pg.nodes:
-            for k in NESTED_KEYS:
-                p = n.get(k)
-                if isinstance(p, dict) and "_value" in p:
-                    ref = pg.ref(p["_value"])
-                    path = ws.ref_path(ref) if ref is not None else None
-                    if path:
-                        out.setdefault(path, []).append(f"{pg.name} #{pg.nid(n)}")
+    for link in ws.subgraph_links():
+        out.setdefault(link.path, []).append(f"{link.parent.name} #{link.parent.nid(link.node)}")
     return out
 
 

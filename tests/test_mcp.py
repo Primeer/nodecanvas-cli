@@ -51,7 +51,8 @@ def test_mcp_tools_in_memory(project):
     async def go():
         async with Client(server, raise_exceptions=True) as c:
             tools = {t.name for t in (await c.list_tools()).tools}
-            assert {"list_graphs", "show", "apply", "lint", "refactor_rename_member", "why", "owners"} <= tools
+            expected = {"list_graphs", "show", "apply", "layout", "lint", "refactor_rename_member", "why", "owners"}
+            assert expected <= tools
             out = _text(await c.call_tool("list_graphs", {}))
             assert "Assets/Graphs/Bot_BT.asset" in out
             out = _text(await c.call_tool("show", {"graph": "Bot_BT"}))

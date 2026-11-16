@@ -189,6 +189,12 @@ conversions, comparing full type names:
 
 Unity reports none of these, since such types do convert (to null): the static checks are what catches them.
 
+`stale-mapping-type`: a mapping stores the type of the subgraph's variable, and after that type changes it stays old
+until the node is drawn in the editor. NodeCanvas converts values to the stored type, then casts them to the
+variable's: an error when that cast cannot succeed, info when the value still fits. The `fix:` op updates the field;
+it shows nowhere in `show` or `diff`, so `apply` prints `(no visible change)`. Because of checks like this one,
+`--changed` also covers the direct parents of changed subgraphs.
+
 Owners and blackboards: `missing-global-var` (warning) — `$Name/Var` has no GlobalBlackboard
 `Name` with that variable; `exposed-override-type` / `exposed-override-stale` (warning) — an owner
 overrides an exposed variable with another type, or one the graph no longer has; `owner-missing-graph`
@@ -203,8 +209,8 @@ an enclosing Iterate first, then variables written earlier on the path from the 
 became empty — that one is almost always a mistake. A `fix:` line is a ready operation for `apply`.
 
 Layout checks: `child-order` (warning) — siblings are not left-to-right in execution order, so dragging
-one in the editor would re-sort them and change behaviour; `overlap` (warning) — nodes closer than the
-editor's minimum node size; `off-grid` (info).
+one in the editor would re-sort them by their centres and change behaviour; `overlap` (warning) — the
+rectangles of two nodes intersect, by estimated size; `off-grid` (info).
 
 `recoverable-missing` (info) means NodeCanvas once saved a task or variable as "missing" while its type
 did not compile; the type exists again, Unity restores it on load and the wrapper disappears on the
@@ -226,9 +232,11 @@ wrappers left after loading, overloads resolved by name fallback, node/variable 
 the file, and console errors logged meanwhile. Every static lint error and type-contract warning for the
 graph is added (`[mapping-type-mismatch] …`), because Unity cannot see those: an error makes the graph `FAIL`, a
 warning prints under `ok`. It waits for script compilation first, and for an Editor that is reloading scripts
-(right after `unity recompile`, say); a project in Safe Mode is reported with its compile errors. Exit code 0 — all
-fine, 1 — problems, 2 — no Editor reachable (it needs the `unity` CLI and the project's
-`com.unity.pipeline` package; `unity pipeline install` adds it). Use it after edits when an Editor is
+(right after `unity recompile`, say); a project in Safe Mode is reported with its compile errors, and an Editor
+stopped on a modal dialog is reported with the dialog's title (answer it in the Editor or with
+`unity command editor dialog`; never answer it for the user). Exit code 0 — all fine, 1 — problems, 2 — no Editor
+reachable (it needs the `unity` CLI 1.0+ and the project's `com.unity.pipeline` package; `unity pipeline install`
+adds it, `unity pipeline upgrade` updates an old one). Use it after edits when an Editor is
 open, instead of asking the user to open the graph. Graphs bound in scenes are checked only when the
 scene is open. `--resave` lets NodeCanvas re-serialize graph assets (drops recoverable Missing
 wrappers); it changes files, so use it only when asked.
@@ -253,9 +261,10 @@ A batch is atomic: if any operation fails, or the result has new lint errors, no
 `--force` only when the error is expected). Connection limits (e.g. a BinarySelector's two children)
 are checked on the final state, so operations can be in any order that makes sense. Ids inside one
 batch always refer to the graph as it was before the batch; give new nodes an `"id"` alias to reference
-them later in the same batch. New and moved nodes are placed on the editor grid (children 10 cells
-below the parent, neighbours at least 15 cells apart); `{"op": "simplify"}` removes Merge nodes left
-with a single parent.
+them later in the same batch. New and moved nodes are placed on the editor grid by their estimated size
+(children 100 px below the parent's bottom edge, 60 px between neighbours' edges); `{"op": "simplify"}` removes
+Merge nodes left with a single parent. To tidy a whole tree run `nodecanvas-cli layout <graph>`; add `--unity` only
+when the user wants exact sizes from the open Editor, it fails without one.
 
 ```json
 [

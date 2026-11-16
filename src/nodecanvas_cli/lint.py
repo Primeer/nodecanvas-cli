@@ -12,7 +12,17 @@ from typing import List, Optional, Tuple
 from .bindings import check_task
 from .model import NESTED_KEYS, Graph, walk
 from .schema import bare_name, short_generic, simple_name
-from .typerel import ERROR, INFO, REASONS, WARNING, Rel, relation, severity
+from .typerel import (
+    ERROR,
+    INFO,
+    REASONS,
+    STORED_TYPE_REASONS,
+    WARNING,
+    Rel,
+    relation,
+    severity,
+    stored_type_severity,
+)
 
 _LEVELS = {INFO: 0, WARNING: 1, ERROR: 2}
 _SKIP_TYPE_PREFIXES = ("System.", "UnityEngine.", "Unity.")
@@ -265,24 +275,42 @@ def _asset_name(ws, g: Graph, name: str) -> List[Issue]:
     ]
 
 
-def parent_mappings(ws) -> dict:
-    """``subgraph address -> {sub variable ids mapped by some parent}`` (computed once per run)."""
-    cached = getattr(ws, "_parent_maps", None)
-    if cached is not None:
-        return cached
-    out: dict = {}
-    for pg in ws.all_graphs():
-        for n in pg.nodes:
-            for k in NESTED_KEYS:
-                p = n.get(k)
-                if isinstance(p, dict) and "_value" in p:
-                    ref = pg.ref(p["_value"])
-                    path = ws.ref_path(ref) if ref is not None else None
-                    if path:
-                        ids = out.setdefault(path, set())
-                        ids.update(m.get("_targetSubGraphVariableID") for m in n.get("_variablesMap") or [])
-    ws._parent_maps = out
-    return out
+def _mapped_by_parents(ws, path: str) -> set:
+    """Ids of the variables of the graph at ``path`` that some parent maps."""
+    return {
+        m.get("_targetSubGraphVariableID")
+        for link in ws.subgraph_links()
+        if link.path == path
+        for m in link.node.get("_variablesMap") or []
+    }
+
+
+def _stored_type_issue(
+    ws, g: Graph, name: str, node: dict, sub: Graph, sname: str, sv: dict, index: int
+) -> Optional[Issue]:
+    """A mapping keeps the type of the subgraph's variable as of when it was made: `_type` does not follow a later
+    change of that type until the node is drawn in the editor, and NodeCanvas converts values to it meanwhile."""
+    from .bindings import _target, var_type
+
+    m = node["_variablesMap"][index]
+    stored, actual = m.get("_type"), var_type(sv)
+    if not stored or not actual or not (m.get("_canRead") or m.get("_canWrite")):
+        return None
+    level = stored_type_severity(ws.schema, stored, actual)
+    if level is None:
+        return None
+    shown_stored, shown_actual = ws.schema.display_pair(stored, actual)
+    text = (
+        f"{sub.name}.${sname}: the mapping stores type {shown_stored}, the variable is {shown_actual}; "
+        f"{STORED_TYPE_REASONS[level]}"
+    )
+    literal = "_value" in m and not (m.get("_name") or m.get("_targetVariableID"))
+    if literal:
+        return Issue(
+            name, f"#{g.nid(node)}", level, "stale-mapping-type", text + "; map it again: the value may not fit"
+        )
+    fix = dict(_target(g, node), op="set", path=f"_variablesMap.{index}._type", raw=True, value=actual)
+    return Issue(name, f"#{g.nid(node)}", level, "stale-mapping-type", text, fix)
 
 
 def _variable_contracts(ws, g: Graph, name: str) -> List[Issue]:
@@ -291,7 +319,7 @@ def _variable_contracts(ws, g: Graph, name: str) -> List[Issue]:
 
     out: List[Issue] = []
     used = variable_usage(g)
-    mapped_by_parents = parent_mappings(ws).get(g.loaded.slot.path, set())
+    mapped_by_parents = _mapped_by_parents(ws, g.loaded.slot.path)
     from .owners import overridden_ids
 
     overridden = overridden_ids(ws, g)
@@ -320,6 +348,7 @@ def _variable_contracts(ws, g: Graph, name: str) -> List[Issue]:
 
         sub_modes = used_variables(sub, list(sub.nodes))
         entries = {m.get("_targetSubGraphVariableID"): m for m in n.get("_variablesMap") or []}
+        positions = {m.get("_targetSubGraphVariableID"): i for i, m in enumerate(n.get("_variablesMap") or [])}
         for sname, sv in sub.variables.items():
             if not sv.get("_isPublic") or "VariableSeperator" in sv.get("$type", ""):
                 continue
@@ -346,6 +375,9 @@ def _variable_contracts(ws, g: Graph, name: str) -> List[Issue]:
                         )
                     )
                 continue
+            stale = _stored_type_issue(ws, g, name, n, sub, sname, sv, positions[sv.get("_id")])
+            if stale is not None:
+                out.append(stale)
             pv = g.var_by_id(m.get("_targetVariableID")) if m.get("_targetVariableID") else None
             issue = _mapping_issue(ws, sub, sname, sv, pv, m) if pv is not None else None
             if issue is not None:
@@ -441,7 +473,16 @@ def _stale_object_refs(ws, g: Graph, name: str) -> List[Issue]:
 
 # Static checks `verify --unity` reports next to what the Editor says: Unity cannot see these, because the types
 # convert (through GetComponent, say) and the result is only wrong at run time.
-TYPE_CONTRACTS = {"mapping-type-mismatch", "param-type-mismatch", "arg-type-mismatch"}
+TYPE_CONTRACTS = {"mapping-type-mismatch", "stale-mapping-type", "param-type-mismatch", "arg-type-mismatch"}
+
+
+def changed_slots_with_parents(ws, quiet: bool = False) -> list:
+    """Graphs changed since HEAD (git) and the direct parents of those: `--changed` for checks across graphs."""
+    changed = ws.changed_slots()
+    parents = ws.parents_of(changed)
+    if parents and not quiet:
+        print(f"also checking {len(parents)} parent graph(s) of changed subgraphs", file=sys.stderr)
+    return changed + parents
 
 
 def static_issues(ws, g: Graph) -> List[Issue]:
@@ -449,10 +490,12 @@ def static_issues(ws, g: Graph) -> List[Issue]:
     return [i for i in lint_graph(ws, g) if i.severity == ERROR or (i.severity == WARNING and i.code in TYPE_CONTRACTS)]
 
 
-NODE_MIN_SIZE = (80.0, 20.0)  # NodeCanvas editor: smallest node rect, so closer nodes always overlap
+OVERLAP_TOLERANCE = 20.0  # node sizes are estimates: ignore rectangles that only touch
 
 
 def _layout_issues(ws, g: Graph, name: str) -> List[Issue]:
+    from .nodesize import workspace_sizes
+
     out: List[Issue] = []
     grid = ws.config.layout.grid
     pos = {}
@@ -460,6 +503,8 @@ def _layout_issues(ws, g: Graph, name: str) -> List[Issue]:
         p = n.get("_position")
         if isinstance(p, dict):
             pos[g.nid(n)] = (float(p.get("x", 0.0)), float(p.get("y", 0.0)))
+    estimated = workspace_sizes(ws, g)
+    size = {g.nid(n): estimated[id(n)] for n in g.nodes}
     for nid, (x, y) in pos.items():
         if x % grid or y % grid:
             out.append(
@@ -468,8 +513,8 @@ def _layout_issues(ws, g: Graph, name: str) -> List[Issue]:
     if g.kind == "bt":
         for n in g.nodes:
             kids = [g.nid(k) for k in g.children(n)]
-            xs = [pos[k][0] for k in kids if k in pos]
-            if len(xs) == len(kids) > 1 and xs != sorted(xs):
+            centres = [pos[k][0] + size[k][0] / 2 for k in kids if k in pos]
+            if len(centres) == len(kids) > 1 and centres != sorted(centres):
                 out.append(
                     Issue(
                         name,
@@ -477,23 +522,26 @@ def _layout_issues(ws, g: Graph, name: str) -> List[Issue]:
                         WARNING,
                         "child-order",
                         "children are not left-to-right in execution order; dragging any of them in the "
-                        "editor re-sorts them by x and changes the order",
+                        "editor re-sorts them by the centre x (estimated from the node's size) and changes the order",
                     )
                 )
     items = sorted(pos.items(), key=lambda kv: (kv[1][1], kv[1][0]))
-    w, h = NODE_MIN_SIZE
+    tol = OVERLAP_TOLERANCE
     for i, (a, (ax, ay)) in enumerate(items):
+        aw, ah = size[a]
         for b, (bx, by) in items[i + 1 :]:
-            if by - ay >= h:
-                break
-            if abs(bx - ax) < w:
+            if by >= ay + ah - tol:
+                break  # sorted by y, so nothing further down can reach this node
+            bw, bh = size[b]
+            if ax < bx + bw - tol and bx < ax + aw - tol:
                 out.append(
                     Issue(
                         name,
                         f"#{a}",
                         WARNING,
                         "overlap",
-                        f"overlaps #{b}: closer than the editor's minimum node size ({w:g}×{h:g} px)",
+                        f"overlaps #{b}: the nodes' rectangles intersect (estimated size {aw:g}×{ah:g} and "
+                        f"{bw:g}×{bh:g} px)",
                     )
                 )
     return out
@@ -511,7 +559,8 @@ def cmd_lint(ws, a) -> int:
         print("error: name graphs or pass --changed, not both", file=sys.stderr)
         return 2
     if a.changed:
-        graphs = [g for g in map(ws.load, ws.changed_slots()) if a.kind is None or g.kind == a.kind]
+        slots = changed_slots_with_parents(ws, quiet=a.json)
+        graphs = [g for g in map(ws.load, slots) if a.kind is None or g.kind == a.kind]
         if not graphs:
             print("[]" if a.json else "no changed graphs (git diff HEAD + untracked files)")
             return 0

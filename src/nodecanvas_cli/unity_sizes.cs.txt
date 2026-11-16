@@ -1,0 +1,41 @@
+// nodecanvas-cli layout --unity, calibrate --unity: executed in the open Editor by `unity command script eval --file`
+// (Roslyn script mode; `eval_file` on a com.unity.pipeline older than 1.0).
+// Top-level statements ending in `return`; nodecanvas-cli substitutes TARGETS.
+// A node's size exists only after the graph editor has drawn it, so each graph goes through the real GUILayout pass in
+// the NodeCanvas window. Nothing is saved or re-imported. The window goes back to its graph, or closes if it was not open.
+var targets = new string[] { /*TARGETS*/ };
+Func<string, string> q = s => "\"" + (s ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+var flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
+var repaint = typeof(EditorWindow).GetMethod("RepaintImmediately", flags);
+if (repaint == null) return "{\"nodecanvas_cli_sizes\":1,\"error\":\"EditorWindow.RepaintImmediately is not available in this Unity version\"}";
+var invariant = System.Globalization.CultureInfo.InvariantCulture;
+var windows = Resources.FindObjectsOfTypeAll<NodeCanvas.Editor.GraphEditor>();
+var opened = windows.Length == 0;
+var window = opened ? EditorWindow.GetWindow<NodeCanvas.Editor.GraphEditor>() : windows[0];
+var previous = NodeCanvas.Editor.GraphEditor.rootGraph;
+var previousOwner = NodeCanvas.Editor.GraphEditor.targetOwner;
+var rows = new List<string>();
+try {
+    foreach (var path in targets) {
+        var graph = AssetDatabase.LoadAssetAtPath<NodeCanvas.Framework.Graph>(path);
+        if (graph == null) { rows.Add("{\"path\":" + q(path) + ",\"status\":\"not-loaded\"}"); continue; }
+        // SetReferences asks for a full pass; the first pass lays nodes out, the second one reports their rects
+        for (var pass = 0; pass < 2; pass++) {
+            NodeCanvas.Editor.GraphEditor.SetReferences(graph);
+            repaint.Invoke(window, null);
+            repaint.Invoke(window, null);
+        }
+        var nodes = new List<string>();
+        foreach (var n in graph.allNodes) {
+            var r = n.rect;
+            // 80x20 is Node.MIN_SIZE, what a node keeps until it is drawn: no node with an icon or a title is that small
+            var drawn = r.width != 80f || r.height != 20f;
+            nodes.Add(drawn ? "[" + r.width.ToString(invariant) + "," + r.height.ToString(invariant) + "]" : "null");
+        }
+        rows.Add("{\"path\":" + q(path) + ",\"status\":\"ok\",\"nodes\":[" + string.Join(",", nodes) + "]}");
+    }
+} finally {
+    if (opened) window.Close();
+    else if (previous != null) NodeCanvas.Editor.GraphEditor.SetReferences(previous, previousOwner, previousOwner != null ? previousOwner.blackboard : previous.blackboard);
+}
+return "{\"nodecanvas_cli_sizes\":1,\"unity\":" + q(Application.unityVersion) + ",\"graphs\":[" + string.Join(",", rows) + "]}";
