@@ -120,7 +120,7 @@ nodecanvas-cli node <graph> <id>... [--raw]         # spec form accepted by appl
 nodecanvas-cli diff <graph> [--rev HEAD]            # compact view vs a git revision
 nodecanvas-cli refs <Type.Member | GraphName | $Variable | TaskType>
 nodecanvas-cli dt export [graph...] [--locales en,ru] [--format csv|json] [-o file] | dt import <file> | dt lint
-nodecanvas-cli why <graph> <node> [--expand]       # conditions on the way from the root to a node
+nodecanvas-cli why <graph> <node> [--expand] [--siblings]  # conditions on the way from the root to a node
 nodecanvas-cli paths [graph] --to <Type.Member | $Var> [--reads]
 nodecanvas-cli stats [graph] [--json]
 nodecanvas-cli scaffold action|condition|decorator|composite <Name> --dir Assets/... [--field "x:BBParameter<float>=1"]

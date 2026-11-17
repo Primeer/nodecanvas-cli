@@ -151,10 +151,27 @@ def build_server(project: Optional[str] = None):
         return cli("diff", graph, "--rev", rev, *_opt("--positions", positions), *_opt("--kind", kind))
 
     @server.tool(annotations=ro)
-    def why(graph: str, node: str, expand: bool = False, kind: Optional[str] = None) -> str:
+    def why(
+        graph: str,
+        node: str,
+        expand: bool = False,
+        siblings: bool = False,
+        siblings_depth: Optional[int] = None,
+        kind: Optional[str] = None,
+    ) -> str:
         """What has to happen for control to reach a node (conditions along each path from the root,
-        FSM transitions in, dialogue choices); expand continues through graphs nesting this one."""
-        return cli("why", graph, node, *_opt("--expand", expand), *_opt("--kind", kind))
+        FSM transitions in, dialogue choices); expand continues through graphs nesting this one;
+        siblings also shows what the earlier Selector/Sequencer siblings and earlier FSM transitions check,
+        opening SubTrees up to siblings_depth levels (default 2)."""
+        return cli(
+            "why",
+            graph,
+            node,
+            *_opt("--expand", expand),
+            *_opt("--siblings", siblings),
+            *_opt("--siblings-depth", siblings_depth),
+            *_opt("--kind", kind),
+        )
 
     @server.tool(annotations=ro)
     def paths(to: str, graph: Optional[str] = None, reads: bool = False) -> str:

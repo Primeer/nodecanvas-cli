@@ -61,7 +61,7 @@ their defaults are shown with their real meaning (taken from the project's C# so
 
 ## Explaining behaviour
 
-- `nodecanvas-cli why <graph> <node> [--expand]` — what has to happen for control to reach a node: the chain
+- `nodecanvas-cli why <graph> <node> [--expand] [--siblings]` — what has to happen for control to reach a node: the chain
   from the root with each step's requirement (`#1 must fail first` under a Selector, `#3 must succeed
   first` under a Sequencer, `branch true` of a BinarySelector, weight and chance under a
   ProbabilitySelector, `at most once per 2s` under a Cooldown, `for each element of $List` under
@@ -69,9 +69,13 @@ their defaults are shown with their real meaning (taken from the project's C# so
   and unreachable nodes are called out. For an FSM state: the transitions leading in (with the earlier
   transitions of the source state that must not fire) and AnyState; for a dialogue node: choices,
   condition branches and jumps. `--expand` continues through the graphs that nest this one as a
-  SubTree / nested state. Use it to answer "why does (doesn't) the bot do X".
-- `nodecanvas-cli paths [graph] --to <Type.Member | $Var> [--reads]` — `why` for every call of a member or
-  every write (`--reads`: also reads) of a variable, across all graphs when no graph is given.
+  SubTree / nested state. `--siblings [--siblings-depth N]` adds, under each step, what the earlier
+  siblings check (`#1 checks: @Self.IsDead`; Sequencers list their leading conditions, then `then N more
+  steps`; SubTrees are opened N levels, 2 by default) and, for an FSM, the conditions of the earlier
+  transitions. It is static: no probabilities except ProbabilitySelector weights; `result of #N …` marks
+  a sibling decided by an action. Use it to answer "why does (doesn't) the bot do X".
+- `nodecanvas-cli paths [graph] --to <Type.Member | $Var> [--reads] [--siblings]` — `why` for every call of a
+  member or every write (`--reads`: also reads) of a variable, across all graphs when no graph is given.
 - `nodecanvas-cli stats [graph] [--json]` — size, BT depth, nodes by role, most called members, most written
   variables, subgraphs used / shared.
 

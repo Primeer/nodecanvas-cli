@@ -67,23 +67,31 @@ def cmd_show(ws: Workspace, a) -> int:
     expand = None
     if a.expand:
         seen = {g.loaded.slot.address}
+        level = [0]
 
-        def expand(node, level=[0]):
-            for k in NESTED_KEYS:
-                v = node.get(k)
-                if isinstance(v, dict) and "_value" in v:
-                    ref = g.ref(v["_value"])
-                    sub = ws.ref_graph(ref) if ref is not None else None
-                    if sub is None or sub.loaded.slot.address in seen or level[0] >= a.expand_depth:
-                        return None
-                    seen.add(sub.loaded.slot.address)
-                    level[0] += 1
-                    try:
-                        return render_graph(sub, ws.renderer(sub), expand=expand, with_header=True)
-                    finally:
-                        level[0] -= 1
-                        seen.discard(sub.loaded.slot.address)
-            return None
+        def make_expand(owner):
+            # `_value` indexes the `_references` of the graph that owns the node, so every nested graph
+            # needs its own resolver
+            def expand(node):
+                for k in NESTED_KEYS:
+                    v = node.get(k)
+                    if isinstance(v, dict) and "_value" in v:
+                        ref = owner.ref(v["_value"])
+                        sub = ws.ref_graph(ref) if ref is not None else None
+                        if sub is None or sub.loaded.slot.address in seen or level[0] >= a.expand_depth:
+                            return None
+                        seen.add(sub.loaded.slot.address)
+                        level[0] += 1
+                        try:
+                            return render_graph(sub, ws.renderer(sub), expand=make_expand(sub), with_header=True)
+                        finally:
+                            level[0] -= 1
+                            seen.discard(sub.loaded.slot.address)
+                return None
+
+            return expand
+
+        expand = make_expand(g)
 
     from .owners import external_vars
 

@@ -46,6 +46,36 @@ def test_why_expand_through_subtree(ncg):
     assert "via Bot_FSM #0:" in out
 
 
+def test_why_siblings(ncg, project):
+    _, out, _ = ncg("why", "Bot_BT", "5")
+    assert "checks:" not in out
+    _, out, _ = ncg("why", "Bot_BT", "5", "--siblings")
+    assert "→ #1 must fail first\n      #1 checks: @Self.IsDead\n" in out
+    assert "→ #3 must succeed first\n      #3 checks: !$Alert\n" in out
+    _, out, _ = ncg("why", "Bot_BT", "9", "--siblings")
+    assert "#2 checks: all of: !$Alert; result of #4 Cooldown" in out and "then 1 more step (#6)" in out
+    # a SubTree sibling is opened into its own graph, resolving the reference through the graph that owns it
+    ops = [
+        {"op": "add", "parent": "0", "id": "s", "index": 1, "node": {"$type": "SubTree"}},
+        {"op": "subgraph-set", "node": "s", "graph": "Sub_BT"},
+    ]
+    (project / "ops.json").write_text(json.dumps(ops))
+    assert ncg("apply", "Bot_BT", project / "ops.json", "--force")[0] == 0
+    _, out, _ = ncg("why", "Bot_BT", "5", "--siblings")
+    assert "#2 checks: Sub_BT: all of: result of #1 $Alert = true; then 2 more steps (#2, #3)" in out
+    _, out, _ = ncg("why", "Bot_BT", "5", "--siblings", "--siblings-depth", "0")
+    assert "#2 checks: result of SubTree Sub_BT (raise --siblings-depth to open)" in out
+
+
+def test_why_siblings_fsm(ncg, project):
+    (project / "ops.json").write_text(json.dumps([{"op": "connect", "from": "1", "to": "0"}]))
+    assert ncg("apply", "Bot_FSM", project / "ops.json", "--force")[0] == 0
+    _, out, _ = ncg("why", "Bot_FSM", "0", "--siblings")
+    assert "(after #0 transitions did not fire (checked in order))\n      --[!$Alert]--> #0 did not fire" in out
+    _, out, _ = ncg("paths", "--to", "Bot.Attack", "--siblings")
+    assert "#1 checks: @Self.IsDead" in out
+
+
 def test_why_fsm_and_dt(ncg):
     _, out, _ = ncg("why", "Bot_FSM", "0")
     assert "start state" in out and "from #1 Combat --[!$Alert]-->" in out

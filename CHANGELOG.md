@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.5.0 — 2026-11-17
+
+- Fixed: `show --expand` opened the wrong graph from the second nesting level on (e.g. a SubTree inside a BT
+  nested in an FSM): the reference index was looked up in the top-level graph's `_references` instead of the
+  graph owning the node. The node label was right, the inlined content was not.
+- New `why --siblings [--siblings-depth N]` (also for `paths` and the MCP `why` tool): under each step lists what
+  the earlier Selector/Sequencer siblings check — conditions, `any of` / `all of`, `not (…)`, SubTrees opened up to N
+  levels (2 by default), `result of #N …` where an action decides — and, for an FSM state, the conditions of the
+  earlier transitions that must not fire.
+
 ## 0.4.0 — 2026-11-16
 
 - `verify --unity`, `layout --unity` and `calibrate --unity` work with the Unity CLI 1.0 and `com.unity.pipeline` 1.0,

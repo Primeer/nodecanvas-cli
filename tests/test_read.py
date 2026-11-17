@@ -61,6 +61,25 @@ def test_show_subtree_and_expand(ncg):
     assert "┆ ├─#2 wait 0.5s" in out and '┆ └─#3 Bot.speed = 4.0 "Set speed"' in out
 
 
+def test_show_expand_resolves_refs_per_graph(ncg, project):
+    # reorder Bot_FSM's _references so its indices no longer coincide with Bot_BT's: nested nodes must be
+    # resolved through the references of the graph that owns them, not the top-level one
+    asset = project / "Assets" / "Graphs" / "Bot_FSM.asset"
+    lines = asset.read_text().split("\n")
+    i = next(k for k, line in enumerate(lines) if "d253e9b372ccacf71f0ef474084feb83" in line)
+    lines[i], lines[i + 1] = lines[i + 1], lines[i]
+    text = "\n".join(lines)
+    text = text.replace('"_nestedBT":{"_value":1}', "@@").replace(
+        '"_nestedBT":{"_value":2}', '"_nestedBT":{"_value":1}'
+    )
+    asset.write_text(text.replace("@@", '"_nestedBT":{"_value":2}'))
+    code, out, err = ncg("show", "Bot_FSM", "--expand")
+    assert code == 0, err
+    combat = out[out.index("#1 Combat") :]
+    assert "┆ Bot_BT  [BT" in combat
+    assert "┆ │     ┆ Sub_BT  [BT, repeat]" in combat
+
+
 def test_ambiguous_and_missing_graph(ncg):
     code, _, err = ncg("show", "nope")
     assert code == 1 and "no graph matches" in err

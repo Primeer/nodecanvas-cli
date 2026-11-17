@@ -19,10 +19,12 @@ LABEL_WIDTH = 56
 
 
 class BTExplainer:
-    def __init__(self, ws, g: Graph):
+    def __init__(self, ws, g: Graph, siblings: int = 0):
         self.ws = ws
         self.g = g
         self.r = ws.renderer(g)
+        # 0: off; otherwise 1 + how many SubTree levels `gate` opens
+        self.siblings = siblings
 
     def f(self, node: dict, name: str) -> str:
         t = node.get("$type", "")
@@ -143,6 +145,75 @@ class BTExplainer:
             return off + "decorated"
         return off + (f"child {idx + 1} of {len(kids)}" if len(kids) > 1 else "only child")
 
+    def gate(self, node: dict, depth: int, seen: frozenset = frozenset()) -> Tuple[str, bool]:
+        """What ``node`` checks, statically: ``(text, pure)``; ``pure`` means it only evaluates conditions, so its
+        result is fully described by ``text`` (otherwise it also depends on actions/time)."""
+        g = self.g
+        if id(node) in seen:
+            return f"#{g.nid(node)} (loop)", False
+        seen = seen | {id(node)}
+        t = simple_name(node.get("$type", ""))
+        kids = g.children(node)
+        cond = node.get("_condition")
+        if t == "ConditionNode":
+            return self.r.task(cond), True
+        if t == "Sequencer" and kids and self.f(node, "random") != "true":
+            parts: List[str] = []
+            pure = True
+            for i, k in enumerate(kids):
+                text, pure = self.gate(k, depth, seen)
+                parts.append(text)
+                if not pure:
+                    # an action decides the rest at run time: summarise what follows instead of guessing
+                    rest = kids[i + 1 :]
+                    if rest:
+                        ids = ", ".join(f"#{g.nid(x)}" for x in rest)
+                        parts.append(f"then {len(rest)} more step{'s' if len(rest) > 1 else ''} ({ids})")
+                    break
+            return (parts[0] if len(parts) == 1 else "all of: " + "; ".join(parts)), pure
+        if t == "Selector" and kids and self.f(node, "random") != "true":
+            gates = [self.gate(k, depth, seen) for k in kids]
+            if len(gates) == 1:
+                return gates[0]
+            return "any of: " + " | ".join(f"({x})" if ";" in x else x for x, _ in gates), all(p for _, p in gates)
+        if t == "Inverter" and kids:
+            text, pure = self.gate(kids[0], depth, seen)
+            return f"not ({text})", pure
+        if t == "ConditionalEvaluator" and kids:
+            text, pure = self.gate(kids[0], depth, seen)
+            return f"{self.r.task(cond)} and {text}", pure
+        if t in ("Succeed", "Fail") and kids:
+            return f"always {'succeeds' if t == 'Succeed' else 'fails'} (after #{g.nid(kids[0])})", True
+        for k in NESTED_KEYS:
+            p = node.get(k)
+            if isinstance(p, dict) and "_value" in p:
+                ref = g.ref(p["_value"])  # the owning graph's references
+                sub = self.ws.ref_graph(ref) if ref is not None else None
+                if sub is None or sub.kind != "bt" or sub.prime is None:
+                    break
+                if depth <= 0:
+                    return f"result of SubTree {sub.name} (raise --siblings-depth to open)", False
+                text, pure = BTExplainer(self.ws, sub, self.siblings).gate(sub.prime, depth - 1)
+                return f"{sub.name}: {text}", pure
+        return f"result of #{g.nid(node)} {self.r.node_label(node)}", False
+
+    def sibling_lines(self, parent: dict, child: dict) -> List[str]:
+        """With ``--siblings``: what the earlier siblings of ``child`` check (Selector: they must fail, Sequencer:
+        they must succeed)."""
+        if not self.siblings:
+            return []
+        t = simple_name(parent.get("$type", ""))
+        if t not in ("Selector", "Sequencer") or self.f(parent, "random") == "true":
+            return []
+        kids = self.g.children(parent)
+        idx = next((i for i, k in enumerate(kids) if k is child), 0)
+        verb = "checks"
+        out = []
+        for k in kids[:idx]:
+            text, _ = self.gate(k, self.siblings - 1)
+            out.append(f"      #{self.g.nid(k)} {verb}: {_clip(text)}")
+        return out
+
     def explain(self, target: dict) -> List[str]:
         paths = self.paths(target)
         if not paths:
@@ -158,6 +229,7 @@ class BTExplainer:
             for i, (node, conn) in enumerate(p):
                 if i + 1 < len(p):
                     lines.append(f"  {_cut(self.label(node))}  → {self.step(node, p[i + 1][0], conn)}")
+                    lines.extend(self.sibling_lines(node, p[i + 1][0]))
                 else:
                     lines.append(f"  {self.label(node)}")
         return lines
@@ -175,6 +247,13 @@ def _disabled(path) -> bool:
     return any(c is not None and c.get("_isDisabled") for _, c in path)
 
 
+GATE_WIDTH = 240
+
+
+def _clip(text: str) -> str:
+    return text if len(text) <= GATE_WIDTH else text[: GATE_WIDTH - 1] + "…"
+
+
 def _cut(text: str) -> str:
     text = text if len(text) <= LABEL_WIDTH else text[: LABEL_WIDTH - 1] + "…"
     return text.ljust(LABEL_WIDTH)
@@ -183,7 +262,7 @@ def _cut(text: str) -> str:
 # ---------------------------------------------------------------------------- FSM / DT
 
 
-def fsm_why(ws, g: Graph, target: dict) -> List[str]:
+def fsm_why(ws, g: Graph, target: dict, siblings: int = 0) -> List[str]:
     r = ws.renderer(g)
     nid = g.nid(target)
     lines = []
@@ -209,6 +288,11 @@ def fsm_why(ws, g: Graph, target: dict) -> List[str]:
                 + " transitions did not fire (checked in order)"
             )
         lines.append(text + (f"  ({'; '.join(notes)})" if notes else ""))
+        if siblings:
+            for o in outs[:idx]:
+                ocond = r.task(o.get("_condition")) if o.get("_condition") else "(always)"
+                off = " [off]" if o.get("_isDisabled") else ""
+                lines.append(f"      --[{ocond}]--> #{o['_targetNode']['$ref']}{off} did not fire")
     if len(lines) == (1 if target is g.prime else 0):
         lines.append("  no transitions lead here" + ("" if target is g.prime else " — the state is never entered"))
     return lines
@@ -274,13 +358,13 @@ def subtree_users(ws, g: Graph) -> List[Tuple[Graph, dict]]:
     return out
 
 
-def why_lines(ws, g: Graph, node: dict, expand: int = 0) -> List[str]:
+def why_lines(ws, g: Graph, node: dict, expand: int = 0, siblings: int = 0) -> List[str]:
     if g.kind == "fsm":
-        body = fsm_why(ws, g, node)
+        body = fsm_why(ws, g, node, siblings)
     elif g.kind == "dt":
         body = dt_why(ws, g, node)
     else:
-        body = BTExplainer(ws, g).explain(node)
+        body = BTExplainer(ws, g, siblings).explain(node)
     if expand <= 0:
         return body
     users = subtree_users(ws, g)
@@ -289,11 +373,15 @@ def why_lines(ws, g: Graph, node: dict, expand: int = 0) -> List[str]:
     out = []
     for pg, pn in users:
         out.append(f"via {pg.name} #{pg.nid(pn)}:")
-        for line in why_lines(ws, pg, pn, expand - 1):
+        for line in why_lines(ws, pg, pn, expand - 1, siblings):
             out.append("  " + line)
         out.append(f"  ↳ inside {g.name}:")
         out.extend("    " + line for line in body)
     return out
+
+
+def _siblings(a) -> int:
+    return 1 + max(0, a.siblings_depth) if a.siblings else 0
 
 
 def cmd_why(ws, a) -> int:
@@ -301,7 +389,7 @@ def cmd_why(ws, a) -> int:
     node = g.node(a.node)
     r = ws.renderer(g)
     print(f"{g.name} #{g.nid(node)} {r.node_label(node)}")
-    for line in why_lines(ws, g, node, a.expand_depth if a.expand else 0):
+    for line in why_lines(ws, g, node, a.expand_depth if a.expand else 0, _siblings(a)):
         print(line)
     return 0
 
@@ -361,11 +449,11 @@ def cmd_paths(ws, a) -> int:
                 print(f"-- transition {g.owner_label(owner)} --[{r.task(owner.get('_condition'))}]-->")
                 if src is not None:
                     print(f"   in state #{g.nid(src)} {r.node_label(src)}, entered:")
-                    for line in why_lines(ws, g, src, a.expand_depth if a.expand else 0):
+                    for line in why_lines(ws, g, src, a.expand_depth if a.expand else 0, _siblings(a)):
                         print("   " + line)
                 continue
             print(f"-- #{g.nid(owner)} {r.node_label(owner)}")
-            for line in why_lines(ws, g, owner, a.expand_depth if a.expand else 0):
+            for line in why_lines(ws, g, owner, a.expand_depth if a.expand else 0, _siblings(a)):
                 print("   " + line)
     if not found:
         what = "writes of" if q.startswith("$") and not a.reads else "uses of"
@@ -520,6 +608,13 @@ def register(sub) -> None:
     s.add_argument("node")
     s.add_argument("--expand", action="store_true", help="also explain how the graph is reached from graphs nesting it")
     s.add_argument("--expand-depth", type=int, default=3)
+    s.add_argument(
+        "--siblings",
+        action="store_true",
+        help="also show what earlier siblings / transitions check (static conditions; no probabilities "
+        "except ProbabilitySelector weights)",
+    )
+    s.add_argument("--siblings-depth", type=int, default=2, help="SubTree levels opened by --siblings")
     s.add_argument("--kind", choices=["bt", "fsm", "dt"])
     s.set_defaults(func=cmd_why)
 
@@ -529,6 +624,13 @@ def register(sub) -> None:
     s.add_argument("--reads", action="store_true", help="for $Variable: include reads, not only writes")
     s.add_argument("--expand", action="store_true", help="also explain how the graph is reached from graphs nesting it")
     s.add_argument("--expand-depth", type=int, default=3)
+    s.add_argument(
+        "--siblings",
+        action="store_true",
+        help="also show what earlier siblings / transitions check (static conditions; no probabilities "
+        "except ProbabilitySelector weights)",
+    )
+    s.add_argument("--siblings-depth", type=int, default=2, help="SubTree levels opened by --siblings")
     s.add_argument("--kind", choices=["bt", "fsm", "dt"])
     s.set_defaults(func=cmd_paths)
 
